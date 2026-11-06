@@ -1,4 +1,4 @@
-FROM node:22-alpine
+FROM node:26-alpine
 
 # コンテナ内では外部からの接続を受け付ける必要があるため明示的に上書きする
 ENV NODE_ENV=production \
