@@ -1,0 +1,12 @@
+.git
+.github
+.gitignore
+.vercel
+.DS_Store
+node_modules
+npm-debug.log*
+README.md
+AGENTS.md
+compose.yaml
+vercel.json
+test

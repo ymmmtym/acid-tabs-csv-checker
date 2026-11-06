@@ -1,0 +1,6 @@
+⭐, example.com https://example.com/ wikipedia.org github.com github.com missing.example.invalid, yellow
+🎵, soundcloud.com bandcamp.com soundcloud.com, green
+📝, blog.* qiita.com zenn.dev, pink
+☁️, aws.amazon.com *.aws cloud.google.com, blue
+🔍, google.com bing.com google.com, blue
+💚, localhost:3000 192.168.1.10 chrome://settings http*://localhost, green

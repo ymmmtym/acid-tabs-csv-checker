@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Acid Tabs CSV Checker</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">AT</span>
+        <div>
+          <h1>Acid Tabs CSV Checker</h1>
+          <p class="muted">CSV を保存せず、その場で検証するローカルツール</p>
+        </div>
+      </div>
+      <span class="badge badge-privacy" id="privacy-badge">保存しません / 外部送信なし</span>
+    </header>
+
+    <main class="layout">
+      <div id="alert" class="alert hidden" role="alert"></div>
+
+      <section class="card" id="upload-card">
+        <header class="card-header">
+          <h2><span class="step">1</span> CSV を読み込む</h2>
+          <p class="muted">
+            Acid Tabs からエクスポートした CSV をそのまま使えます。内容はメモリ上でのみ処理されます。
+          </p>
+        </header>
+
+        <div
+          id="dropzone"
+          class="dropzone"
+          tabindex="0"
+          role="button"
+          aria-label="CSV ファイルを選択"
+        >
+          <span class="dropzone-icon" aria-hidden="true">CSV</span>
+          <strong>ドラッグ &amp; ドロップ</strong>
+          <span class="muted">またはクリックしてファイルを選択</span>
+        </div>
+        <input type="file" id="file-input" accept=".csv,text/csv" hidden />
+
+        <div class="upload-actions">
+          <button type="button" id="sample-btn" class="btn btn-secondary">
+            サンプル CSV を試す
+          </button>
+
+          <details class="paste-panel">
+            <summary>CSV を貼り付ける</summary>
+            <textarea
+              id="csv-input"
+              rows="6"
+              spellcheck="false"
+              placeholder="⭐, example.com github.com, yellow"
+            ></textarea>
+            <button type="button" id="paste-btn" class="btn btn-secondary">
+              この内容で読み込む
+            </button>
+          </details>
+        </div>
+
+        <p id="file-status" class="muted" aria-live="polite"></p>
+      </section>
+
+      <section class="card hidden" id="preview-card">
+        <header class="card-header">
+          <h2><span class="step">2</span> 内容を確認</h2>
+          <p class="muted">読み込んだ CSV の構成と、自動チェックの対象外になる URL を確認できます。</p>
+        </header>
+
+        <div class="stats" id="preview-stats"></div>
+
+        <details class="sub-panel" open>
+          <summary>カテゴリ一覧</summary>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>絵文字</th>
+                  <th>色</th>
+                  <th class="numeric">URL 数</th>
+                  <th class="numeric">行</th>
+                </tr>
+              </thead>
+              <tbody id="category-table"></tbody>
+            </table>
+          </div>
+        </details>
+
+        <details class="sub-panel">
+          <summary>構造エラー・注意</summary>
+          <div id="preview-issues" class="issue-list"></div>
+        </details>
+      </section>
+
+      <section class="card hidden" id="options-card">
+        <header class="card-header">
+          <h2><span class="step">3</span> チェック実行</h2>
+          <p class="muted">
+            DNS・HTTP・www ドメインは対象ドメインへのみアクセスします。結果は保存されません。
+          </p>
+        </header>
+
+        <div class="options-grid">
+          <label class="check">
+            <input type="checkbox" id="opt-dns" checked />
+            <span>DNS 解決</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="opt-http" checked />
+            <span>HTTP アクセス</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="opt-www" checked />
+            <span>www ドメイン</span>
+          </label>
+          <label class="select-field">
+            <span>タイムアウト</span>
+            <select id="opt-timeout">
+              <option value="3000">3 秒</option>
+              <option value="5000">5 秒</option>
+              <option value="10000" selected>10 秒</option>
+              <option value="20000">20 秒</option>
+              <option value="30000">30 秒</option>
+            </select>
+          </label>
+          <label class="select-field">
+            <span>並列数</span>
+            <select id="opt-concurrency">
+              <option value="6">6</option>
+              <option value="12">12</option>
+              <option value="18">18</option>
+              <option value="24">24</option>
+              <option value="30" selected>30</option>
+            </select>
+          </label>
+        </div>
+        <p class="options-note muted">
+          www ドメインは元 URL が失敗した場合のみ確認します。並列数は 6 から開始し、6 件完了ごとに 6 ずつ増えて指定値（最大 30）になります。
+        </p>
+
+        <div class="actions">
+          <button type="button" id="start-btn" class="btn btn-primary">チェック開始</button>
+          <button type="button" id="cancel-btn" class="btn btn-secondary hidden">中止</button>
+        </div>
+
+        <div id="progress" class="progress hidden">
+          <progress id="progress-bar" max="100" value="0"></progress>
+          <p id="progress-text" class="muted" aria-live="polite"></p>
+        </div>
+      </section>
+
+      <section class="card hidden" id="results-card">
+        <header class="card-header">
+          <h2><span class="step">4</span> 結果</h2>
+          <p class="muted">チェックが完了した URL から順に表示されます。</p>
+        </header>
+
+        <div class="stats" id="result-stats"></div>
+
+        <div class="result-toolbar">
+          <div class="tabs" id="result-tabs" role="tablist"></div>
+          <input
+            type="search"
+            id="search"
+            class="search"
+            placeholder="URL・ホスト・カテゴリで絞り込み"
+            aria-label="結果を絞り込み"
+          />
+        </div>
+
+        <div class="cleanup-panel">
+          <div class="cleanup-actions">
+            <button type="button" id="select-problems" class="btn btn-ghost">
+              問題ありを選択
+            </button>
+            <button type="button" id="select-visible" class="btn btn-ghost">
+              表示中を選択
+            </button>
+            <button type="button" id="clear-selection" class="btn btn-ghost">
+              選択解除
+            </button>
+            <span id="selection-count" class="selection-count muted">選択中: 0件</span>
+          </div>
+          <div class="cleanup-export">
+            <span class="muted">削除後の CSV:</span>
+            <button type="button" id="download-clean" class="btn btn-secondary" disabled>
+              ダウンロード
+            </button>
+            <button type="button" id="copy-clean" class="btn btn-secondary" disabled>
+              コピー
+            </button>
+            <span id="copy-status" class="copy-status muted" aria-live="polite"></span>
+          </div>
+        </div>
+
+        <div class="table-wrap table-wrap-results">
+          <table class="data-table result-table">
+            <thead>
+              <tr>
+                <th class="select-col">
+                  <input
+                    type="checkbox"
+                    id="select-all"
+                    aria-label="表示中の URL をすべて選択"
+                  />
+                </th>
+                <th>状態</th>
+                <th class="url-column">URL</th>
+                <th>ホスト</th>
+                <th>カテゴリ</th>
+                <th>DNS</th>
+                <th>HTTP</th>
+                <th>WWW</th>
+                <th>詳細</th>
+              </tr>
+            </thead>
+            <tbody id="result-table"></tbody>
+          </table>
+        </div>
+        <p id="result-empty" class="muted hidden">条件に一致する URL はありません。</p>
+
+        <footer class="results-footer">
+          <div class="downloads" id="downloads">
+            <span class="muted">レポートをダウンロード:</span>
+            <button type="button" class="btn btn-secondary" data-format="json">JSON</button>
+            <button type="button" class="btn btn-secondary" data-format="csv">CSV</button>
+            <button type="button" class="btn btn-secondary" data-format="markdown">Markdown</button>
+          </div>
+          <button type="button" id="reset-btn" class="btn btn-ghost">最初からやり直す</button>
+        </footer>
+      </section>
+
+      <section class="card hidden" id="issues-card">
+        <header class="card-header">
+          <h2>重複・特殊 URL</h2>
+          <p class="muted">ネットワークチェックの対象外にした URL と、重複している URL の一覧です。</p>
+        </header>
+        <div id="issues-content" class="issues-content"></div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>
+        Acid Tabs の CSV を検証するツールです。アップロードされた CSV はディスク・DB・ブラウザストレージのいずれにも保存しません。
+      </p>
+    </footer>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

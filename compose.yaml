@@ -1,0 +1,18 @@
+services:
+  app:
+    build: .
+    image: acid-tabs-checker:local
+    ports:
+      - "8080:8080"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      APP_ENV: local
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
