@@ -1,4 +1,5 @@
 import { buildCleanedCsv } from './clean.js';
+import { attachResultKeyboardNavigation } from './result-keyboard.js';
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -15,7 +16,8 @@ const state = {
   abort: null,
   filter: 'all',
   search: '',
-  runId: 0
+  runId: 0,
+  focusedRowIndex: -1
 };
 
 const LEVEL_LABELS = {
@@ -485,7 +487,16 @@ function renderResults() {
   updateSelectionUi();
 }
 
-function setProgress(completed, total, counts = null) {
+let lastProgressReport = 0;
+const PROGRESS_REPORT_INTERVAL_MS = 150; // アクティブな出力の間隔を抑えて視覚的な跳ね上げを防ぐ
+
+function setProgress(completed, total, counts = null, force = false) {
+  const now = Date.now();
+  if (!force && state.running && now - lastProgressReport < PROGRESS_REPORT_INTERVAL_MS) {
+    return; // アクティブなチェック中に頻繁な更新を抑制する
+  }
+  lastProgressReport = now;
+
   const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
   $('#progress-bar').value = percent;
 
@@ -675,7 +686,7 @@ function handleEvent(event, runId = state.runId) {
     scheduleResultsRender();
   } else if (event.type === 'done') {
     state.finished = true;
-    setProgress(event.progress.completed, event.progress.total, event.progress.counts);
+    setProgress(event.progress.completed, event.progress.total, event.progress.counts, true);
     renderResults();
   }
 }
@@ -951,6 +962,28 @@ async function copyCleanedCsv() {
   if (!state.analysis || state.selected.size === 0) return;
 
   const text = cleanedCsvText();
+  const estimatedBytes = new Blob([text]).size;
+  const progressSteps = 10;
+  const stepIntervalMs = 15;
+  let currentStep = 0;
+  let timerId = null;
+
+  const updateCopyStatus = () => {
+    const pct = progressSteps > 0 ? Math.min(99, Math.round((currentStep / progressSteps) * 100)) : 0;
+    showCopyStatus(`コピー中... ${pct}%`, true);
+  };
+
+  if (estimatedBytes > 10 * 1024) {
+    for (let i = 1; i <= progressSteps; i += 1) {
+      currentStep = i;
+      updateCopyStatus();
+      await new Promise((resolve) => {
+        timerId = setTimeout(resolve, stepIntervalMs);
+      });
+    }
+  }
+  if (timerId) clearTimeout(timerId);
+
   try {
     if (navigator.clipboard?.writeText) {
       await navigator.clipboard.writeText(text);
@@ -1061,6 +1094,8 @@ function init() {
   });
 
   $('#reset-btn').addEventListener('click', reset);
+
+  attachResultKeyboardNavigation($('#result-table'), state);
 }
 
 init();
