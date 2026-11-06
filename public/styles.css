@@ -693,6 +693,11 @@ h2 {
   background: color-mix(in srgb, var(--primary) 6%, transparent);
 }
 
+.result-table tr.is-focused {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
 .copy-fallback {
   position: fixed;
   top: -1000px;
