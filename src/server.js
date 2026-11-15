@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -202,8 +203,11 @@ async function handleCheck(req, res) {
   let compressor = null;
   let completion;
   let connected = true;
+  const disconnected = new AbortController();
+  let draining;
   res.on('close', () => {
     connected = false;
+    disconnected.abort();
     if (!res.writableFinished) compressor?.destroy();
   });
   if (encoding) {
@@ -226,15 +230,21 @@ async function handleCheck(req, res) {
     res.writeHead(200, headers);
   }
 
-  const send = (payload) => {
+  const send = async (payload) => {
     if (!connected || res.writableEnded) return;
-    out.write(`${JSON.stringify(payload)}\n`);
+    if (!out.write(`${JSON.stringify(payload)}\n`)) {
+      // Concurrent results share one drain listener while the writable is full.
+      draining ??= once(out, 'drain', { signal: disconnected.signal })
+        .finally(() => { draining = null; });
+      await draining;
+    }
+    if (!connected || res.writableEnded) return;
     compressor?.flush(encoding === 'br' ? constants.BROTLI_OPERATION_FLUSH : constants.Z_SYNC_FLUSH);
   };
 
   try {
-    send({ type: 'analysis', analysis });
-    send({
+    await send({ type: 'analysis', analysis });
+    await send({
       type: 'start',
       total: analysis.urls.length,
       checkable: analysis.summary.checkable
@@ -248,7 +258,7 @@ async function handleCheck(req, res) {
       onResult(result) {
         counts[result.level] = (counts[result.level] ?? 0) + 1;
         completed += 1;
-        send({
+        return send({
           type: 'result',
           result,
           progress: { completed, total: analysis.urls.length, counts }
@@ -256,7 +266,7 @@ async function handleCheck(req, res) {
       }
     });
 
-    send({
+    await send({
       type: 'done',
       progress: { completed, total: analysis.urls.length, counts },
       summary: { ...analysis.summary, ...counts }

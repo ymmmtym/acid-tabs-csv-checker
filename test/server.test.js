@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { request } from 'node:http';
+import { request, ServerResponse } from 'node:http';
 import { once } from 'node:events';
 import dns from 'node:dns/promises';
 import { syncBuiltinESMExports } from 'node:module';
@@ -136,5 +136,45 @@ for (const Compressor of [Gzip, BrotliCompress]) {
     });
     const health = await open(port, '/api/health', 'identity');
     assert.equal(JSON.parse(await collect(health)).ok, true);
+  });
+}
+
+for (const encoding of ['identity', 'gzip', 'br']) {
+  test(encoding + ' waits for drain before sending more records or flushing', { timeout: 5000 }, async (t) => {
+    const prototype = encoding === 'identity' ? ServerResponse.prototype
+      : (encoding === 'gzip' ? Gzip : BrotliCompress).prototype;
+    const originalWrite = prototype.write;
+    let pending = false;
+    let writes = 0;
+    let flushes = 0;
+    t.mock.method(prototype, 'write', function (chunk, ...args) {
+      if (typeof chunk !== 'string') return originalWrite.call(this, chunk, ...args);
+      assert.equal(pending, false, 'records must wait for the previous drain');
+      originalWrite.call(this, chunk, ...args);
+      writes += 1;
+      pending = true;
+      setImmediate(() => {
+        pending = false;
+        this.emit('drain');
+      });
+      return false;
+    });
+    if (encoding !== 'identity') {
+      const originalFlush = prototype.flush;
+      t.mock.method(prototype, 'flush', function (...args) {
+        assert.equal(pending, false, 'flush must follow drain');
+        flushes += 1;
+        return originalFlush.apply(this, args);
+      });
+    }
+    const port = await start(t);
+    const res = await open(port, '/api/check', encoding, {
+      csv: '⭐, http://localhost http://127.0.0.1, yellow',
+      options: { concurrency: 1 }
+    });
+    const records = (await collect(res)).trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(records.map(record => record.type), ['analysis', 'start', 'result', 'result', 'done']);
+    assert.equal(writes, 5);
+    assert.equal(flushes, encoding === 'identity' ? 0 : 5);
   });
 }

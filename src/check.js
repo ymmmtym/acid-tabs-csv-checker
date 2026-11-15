@@ -396,9 +396,9 @@ export async function runChecks(entries, options = {}, hooks = {}) {
         active += 1;
 
         checkOne(entries[index], checkOptions, deps)
-          .then((result) => {
+          .then(async (result) => {
             results[index] = result;
-            hooks.onResult?.(result, index);
+            await hooks.onResult?.(result, index);
           })
           .catch(fail)
           .finally(() => {
