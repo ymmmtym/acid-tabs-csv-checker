@@ -75,10 +75,21 @@ function create(tag, attrs = {}, children = []) {
   return node;
 }
 
+function announce(message) {
+  const region = $('#sr-status');
+  if (!region) return;
+  region.textContent = '';
+  if (!message) return;
+  window.setTimeout(() => {
+    region.textContent = message;
+  }, 20);
+}
+
 function showAlert(message, kind = 'error') {
   const alert = $('#alert');
   alert.textContent = message;
   alert.className = `alert${kind === 'info' ? ' is-info' : ''}`;
+  announce(message);
 }
 
 function clearAlert() {
@@ -406,9 +417,11 @@ function renderResults() {
       ).length;
       return create('button', {
         type: 'button',
+        id: `tab-${filter.id}`,
         class: `tab${filter.id === existingFilter ? ' is-active' : ''}`,
         role: 'tab',
         'aria-selected': filter.id === existingFilter ? 'true' : 'false',
+        'aria-controls': 'result-table',
         text: `${filter.label} ${count}`,
         onclick: () => {
           state.filter = filter.id;
@@ -564,6 +577,7 @@ async function loadCsv(text, name) {
     $('#options-card').classList.remove('hidden');
     $('#issues-card').classList.remove('hidden');
     setFileStatus(`${name} を読み込みました（保存していません）。`);
+    announce(`${name} を読み込みました。${state.analysis.summary.urls} 件の URL を検出しました。`);
   } catch (error) {
     state.analysis = null;
     showAlert(error.message);
@@ -688,6 +702,7 @@ function handleEvent(event, runId = state.runId) {
     state.finished = true;
     setProgress(event.progress.completed, event.progress.total, event.progress.counts, true);
     renderResults();
+    announce('チェックが完了しました。');
   }
 }
 
@@ -1001,11 +1016,41 @@ async function copyCleanedCsv() {
   }
 }
 
+function trapFocus(container, event) {
+  if (event.key !== 'Tab') return;
+  const focusable = container.querySelectorAll(
+    'a[href], button:not([disabled]), textarea, input, select, summary, [tabindex]:not([tabindex="-1"])'
+  );
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 function init() {
   const dropzone = $('#dropzone');
   const fileInput = $('#file-input');
 
   applyHealthBadge();
+
+  const pastePanel = document.querySelector('.paste-panel');
+  if (pastePanel) {
+    pastePanel.addEventListener('keydown', (event) => {
+      if (!pastePanel.open) return;
+      if (event.key === 'Escape') {
+        pastePanel.open = false;
+        pastePanel.querySelector('summary')?.focus();
+        return;
+      }
+      trapFocus(pastePanel, event);
+    });
+  }
 
   dropzone.addEventListener('click', () => fileInput.click());
   dropzone.addEventListener('keydown', (event) => {
