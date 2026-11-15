@@ -422,7 +422,6 @@ function renderResults() {
         role: 'tab',
         'aria-selected': filter.id === existingFilter ? 'true' : 'false',
         'aria-controls': 'result-table',
-        tabindex: filter.id === existingFilter ? '0' : '-1',
         text: `${filter.label} ${count}`,
         onclick: () => {
           state.filter = filter.id;

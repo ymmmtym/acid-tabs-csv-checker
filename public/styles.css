@@ -212,10 +212,7 @@ h2 {
   top: 0.75rem;
 }
 
-#main-content:focus {
-  outline: none;
-}
-
+#main-content:focus,
 :focus-visible {
   outline: 3px solid var(--focus);
   outline-offset: 2px;
@@ -668,7 +665,7 @@ h2 {
 .search:focus,
 .paste-panel textarea:focus,
 .select-field select:focus {
-  outline: 2px solid color-mix(in srgb, var(--primary) 45%, transparent);
+  outline: 2px solid var(--focus);
   outline-offset: 1px;
 }
 
