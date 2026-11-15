@@ -22,12 +22,39 @@ const MIME_TYPES = {
   '.ico': 'image/x-icon'
 };
 
+const CSP_REPORT_URI = process.env.CSP_REPORT_URI;
+
+function buildContentSecurityPolicy() {
+  const directives = [
+    "default-src 'self'",
+    "img-src 'self' data:",
+    "style-src 'self'",
+    "script-src 'self'",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "frame-src 'none'",
+    "worker-src 'self'",
+    "manifest-src 'self'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'"
+  ];
+
+  // CSP 違反レポート: 本番等で送信先を設定する場合に有効化する。
+  // 違反レポートにはブロックされた URI 等が含まれるが、CSV 本文や URL 一覧は
+  // 含まれない想定のため、送信先は運用環境側で管理する。
+  if (CSP_REPORT_URI) {
+    directives.push(`report-uri ${CSP_REPORT_URI}`);
+  }
+
+  return directives.join('; ');
+}
+
 const SECURITY_HEADERS = {
   'x-content-type-options': 'nosniff',
   'x-frame-options': 'DENY',
   'referrer-policy': 'no-referrer',
-  'content-security-policy':
-    "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  'content-security-policy': buildContentSecurityPolicy()
 };
 
 class HttpError extends Error {
@@ -124,6 +151,17 @@ async function handleAnalyze(req, res) {
   const body = await readJson(req);
   const analysis = analyzeCsv(requireCsv(body));
   sendJson(res, 200, { analysis });
+}
+
+async function handleCspReport(req, res) {
+  // ブラウザからの CSP 違反レポートを受け付ける。本文には CSV 内容や URL 一覧は
+  // 含まれない想定だが、念のため内容は読み捨ててログにも出さない。
+  await readBody(req).catch(() => {});
+  res.writeHead(204, {
+    ...SECURITY_HEADERS,
+    'cache-control': 'no-store'
+  });
+  res.end();
 }
 
 async function handleCheck(req, res) {
@@ -231,6 +269,11 @@ export function createApp() {
 
       if (req.method === 'POST' && url.pathname === '/api/check') {
         await handleCheck(req, res);
+        return;
+      }
+
+      if (req.method === 'POST' && url.pathname === '/api/csp-report') {
+        await handleCspReport(req, res);
         return;
       }
 
