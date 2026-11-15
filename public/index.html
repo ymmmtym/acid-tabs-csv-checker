@@ -9,6 +9,7 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <a href="#main-content" class="skip-link">メインコンテンツへスキップ</a>
     <header class="site-header">
       <div class="brand">
         <span class="logo" aria-hidden="true">AT</span>
@@ -20,8 +21,9 @@
       <span class="badge badge-privacy" id="privacy-badge">保存しません / 外部送信なし</span>
     </header>
 
-    <main class="layout">
-      <div id="alert" class="alert hidden" role="alert"></div>
+    <main class="layout" id="main-content" tabindex="-1">
+      <div id="alert" class="alert hidden" role="alert" aria-live="assertive"></div>
+      <div id="sr-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
 
       <section class="card" id="upload-card">
         <header class="card-header">
@@ -51,10 +53,12 @@
 
           <details class="paste-panel">
             <summary>CSV を貼り付ける</summary>
+            <label for="csv-input" class="visually-hidden">CSV テキスト</label>
             <textarea
               id="csv-input"
               rows="6"
               spellcheck="false"
+              aria-label="CSV テキストを貼り付け"
               placeholder="⭐, example.com github.com, yellow"
             ></textarea>
             <button type="button" id="paste-btn" class="btn btn-secondary">
@@ -77,13 +81,14 @@
         <details class="sub-panel" open>
           <summary>カテゴリ一覧</summary>
           <div class="table-wrap">
-            <table class="data-table">
+            <table class="data-table" aria-label="カテゴリ一覧">
+              <caption class="visually-hidden">読み込んだ CSV のカテゴリ一覧</caption>
               <thead>
                 <tr>
-                  <th>絵文字</th>
-                  <th>色</th>
-                  <th class="numeric">URL 数</th>
-                  <th class="numeric">行</th>
+                  <th scope="col">絵文字</th>
+                  <th scope="col">色</th>
+                  <th scope="col" class="numeric">URL 数</th>
+                  <th scope="col" class="numeric">行</th>
                 </tr>
               </thead>
               <tbody id="category-table"></tbody>
@@ -149,7 +154,8 @@
         </div>
 
         <div id="progress" class="progress hidden">
-          <progress id="progress-bar" max="100" value="0"></progress>
+          <label for="progress-bar" class="visually-hidden">チェック進捗</label>
+          <progress id="progress-bar" max="100" value="0" aria-label="チェック進捗"></progress>
           <p id="progress-text" class="muted" aria-live="polite"></p>
         </div>
       </section>
@@ -163,7 +169,7 @@
         <div class="stats" id="result-stats"></div>
 
         <div class="result-toolbar">
-          <div class="tabs" id="result-tabs" role="tablist"></div>
+          <div class="tabs" id="result-tabs" role="tablist" aria-label="結果フィルタ"></div>
           <input
             type="search"
             id="search"
@@ -199,24 +205,26 @@
         </div>
 
         <div class="table-wrap table-wrap-results">
-          <table class="data-table result-table">
+          <table class="data-table result-table" aria-label="チェック結果" aria-describedby="result-empty">
+            <caption class="visually-hidden">URL チェック結果一覧</caption>
             <thead>
               <tr>
-                <th class="select-col">
+                <th scope="col" class="select-col">
+                  <label for="select-all" class="visually-hidden">表示中の URL をすべて選択</label>
                   <input
                     type="checkbox"
                     id="select-all"
                     aria-label="表示中の URL をすべて選択"
                   />
                 </th>
-                <th>状態</th>
-                <th class="url-column">URL</th>
-                <th>ホスト</th>
-                <th>カテゴリ</th>
-                <th>DNS</th>
-                <th>HTTP</th>
-                <th>WWW</th>
-                <th>詳細</th>
+                <th scope="col">状態</th>
+                <th scope="col" class="url-column">URL</th>
+                <th scope="col">ホスト</th>
+                <th scope="col">カテゴリ</th>
+                <th scope="col">DNS</th>
+                <th scope="col">HTTP</th>
+                <th scope="col">WWW</th>
+                <th scope="col">詳細</th>
               </tr>
             </thead>
             <tbody id="result-table"></tbody>
@@ -227,9 +235,9 @@
         <footer class="results-footer">
           <div class="downloads" id="downloads">
             <span class="muted">レポートをダウンロード:</span>
-            <button type="button" class="btn btn-secondary" data-format="json">JSON</button>
-            <button type="button" class="btn btn-secondary" data-format="csv">CSV</button>
-            <button type="button" class="btn btn-secondary" data-format="markdown">Markdown</button>
+            <button type="button" class="btn btn-secondary" data-format="json" aria-label="レポートを JSON でダウンロード">JSON</button>
+            <button type="button" class="btn btn-secondary" data-format="csv" aria-label="レポートを CSV でダウンロード">CSV</button>
+            <button type="button" class="btn btn-secondary" data-format="markdown" aria-label="レポートを Markdown でダウンロード">Markdown</button>
           </div>
           <button type="button" id="reset-btn" class="btn btn-ghost">最初からやり直す</button>
         </footer>
