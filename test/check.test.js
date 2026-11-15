@@ -442,3 +442,26 @@ test('runChecks が全件を処理して完了ごとに通知する', async () =
   assert.equal(seen.length, 2);
   assert.equal(results.find((result) => result.host === 'dead.com').level, 'dead');
 });
+
+test('runChecks waits for asynchronous result delivery before producing more results', async () => {
+  const entries = analyzeCsv('⭐, http://localhost http://127.0.0.1, yellow').urls;
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const seen = [];
+  let finished = false;
+  const checking = runChecks(entries, { concurrency: 1 }, {
+    async onResult(result) {
+      seen.push(result.id);
+      await blocked;
+    }
+  }).then(results => { finished = true; return results; });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(seen.length, 1);
+    assert.equal(finished, false);
+  } finally {
+    release();
+    await checking;
+  }
+  assert.equal(seen.length, 2);
+});

@@ -1,9 +1,16 @@
 import { createServer } from 'node:http';
+import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
+import { brotliCompress, gzip, createBrotliCompress, createGzip, constants } from 'node:zlib';
+import { finished } from 'node:stream';
 import { analyzeCsv } from './parse.js';
 import { runChecks } from './check.js';
+
+const gzipAsync = promisify(gzip);
+const brotliCompressAsync = promisify(brotliCompress);
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -57,6 +64,49 @@ const SECURITY_HEADERS = {
   'content-security-policy': buildContentSecurityPolicy()
 };
 
+function cacheControlForStatic(relativePath) {
+  if (relativePath === 'index.html') return 'no-store';
+  // Only content hashes in the pathname make an asset immutable.
+  if (/[.-][a-f0-9]{8,}\.(?:js|css|svg|ico)$/i.test(relativePath)) {
+    return 'public, max-age=31536000, immutable';
+  }
+  if (['.js', '.css', '.svg', '.ico'].includes(extname(relativePath))) {
+    return 'public, no-cache';
+  }
+  return 'no-store';
+}
+
+function selectEncoding(acceptEncoding = '', preferIdentity = false) {
+  const weights = new Map();
+  for (const part of acceptEncoding.split(',')) {
+    const match = /^\s*([!#$%&'*+.^_`|~0-9a-z-]+)\s*(?:;\s*q\s*=\s*(0(?:\.\d{0,3})?|1(?:\.0{0,3})?))?\s*$/i.exec(part);
+    if (!match) continue;
+    const coding = match[1].toLowerCase();
+    const weight = match[2] === undefined ? 1 : Number(match[2]);
+    weights.set(coding, Math.max(weights.get(coding) ?? 0, weight));
+  }
+  const identityWeight = weights.get('identity') ?? (weights.get('*') === 0 ? 0 : 1);
+  if (preferIdentity && identityWeight > 0 && !weights.has('identity')) return null;
+
+  let encoding = null;
+  let best = weights.get('identity') ?? 0;
+  for (const coding of ['br', 'gzip']) {
+    const weight = weights.get(coding) ?? weights.get('*') ?? 0;
+    if (weight > best) {
+      encoding = coding;
+      best = weight;
+    }
+  }
+  if (best > 0 || identityWeight > 0) return encoding;
+  throw new HttpError(406, 'Not Acceptable');
+}
+
+async function compressBody(body, encoding) {
+  if (encoding === 'br') return brotliCompressAsync(body);
+  if (encoding === 'gzip') return gzipAsync(body);
+  return body;
+}
+
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -64,14 +114,24 @@ class HttpError extends Error {
   }
 }
 
-function sendJson(res, status, payload) {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
+async function sendJson(req, res, status, payload) {
+  const json = JSON.stringify(payload);
+  let body = Buffer.from(json);
+  const headers = {
     ...SECURITY_HEADERS,
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
-    'content-length': Buffer.byteLength(body)
-  });
+    vary: 'Accept-Encoding'
+  };
+
+  const encoding = selectEncoding(req.headers['accept-encoding'], body.length < 1024);
+  if (encoding) {
+    body = await compressBody(body, encoding);
+    headers['content-encoding'] = encoding;
+  }
+
+  headers['content-length'] = body.length;
+  res.writeHead(status, headers);
   res.end(body);
 }
 
@@ -150,7 +210,7 @@ function requireCsv(body) {
 async function handleAnalyze(req, res) {
   const body = await readJson(req);
   const analysis = analyzeCsv(requireCsv(body));
-  sendJson(res, 200, { analysis });
+  await sendJson(req, res, 200, { analysis });
 }
 
 async function handleCspReport(req, res) {
@@ -169,52 +229,96 @@ async function handleCheck(req, res) {
   const analysis = analyzeCsv(requireCsv(body));
   const options = sanitizeOptions(body.options);
 
-  let connected = true;
-  res.on('close', () => {
-    connected = false;
-  });
-
-  res.writeHead(200, {
+  const encoding = selectEncoding(req.headers['accept-encoding']);
+  const headers = {
     ...SECURITY_HEADERS,
     'content-type': 'application/x-ndjson; charset=utf-8',
-    'cache-control': 'no-store'
-  });
-
-  const send = (payload) => {
-    if (!connected || res.writableEnded) return;
-    res.write(`${JSON.stringify(payload)}\n`);
+    'cache-control': 'no-store',
+    vary: 'Accept-Encoding'
   };
 
-  send({ type: 'analysis', analysis });
-  send({
-    type: 'start',
-    total: analysis.urls.length,
-    checkable: analysis.summary.checkable
+  let out = res;
+  let compressor = null;
+  let completion;
+  let connected = true;
+  const disconnected = new AbortController();
+  let draining;
+  res.on('close', () => {
+    connected = false;
+    disconnected.abort();
+    if (!res.writableFinished) compressor?.destroy();
   });
-
-  const counts = { ok: 0, warn: 0, dead: 0, error: 0, skipped: 0 };
-  let completed = 0;
-
-  await runChecks(analysis.urls, options, {
-    shouldStop: () => !connected,
-    onResult(result) {
-      counts[result.level] = (counts[result.level] ?? 0) + 1;
-      completed += 1;
-      send({
-        type: 'result',
-        result,
-        progress: { completed, total: analysis.urls.length, counts }
+  if (encoding) {
+    compressor = encoding === 'br' ? createBrotliCompress() : createGzip();
+    headers['content-encoding'] = encoding;
+    res.writeHead(200, headers);
+    completion = new Promise((resolvePromise) => {
+      const cleanup = finished(compressor, (error) => {
+        cleanup();
+        if (error) {
+          connected = false;
+          res.destroy();
+        }
+        resolvePromise();
       });
+    });
+    compressor.pipe(res);
+    out = compressor;
+  } else {
+    res.writeHead(200, headers);
+  }
+
+  const send = async (payload) => {
+    if (!connected || res.writableEnded) return;
+    if (!out.write(`${JSON.stringify(payload)}\n`)) {
+      // Concurrent results share one drain listener while the writable is full.
+      draining ??= once(out, 'drain', { signal: disconnected.signal })
+        .finally(() => { draining = null; });
+      await draining;
     }
-  });
+    if (!connected || res.writableEnded) return;
+    compressor?.flush(encoding === 'br' ? constants.BROTLI_OPERATION_FLUSH : constants.Z_SYNC_FLUSH);
+  };
 
-  send({
-    type: 'done',
-    progress: { completed, total: analysis.urls.length, counts },
-    summary: { ...analysis.summary, ...counts }
-  });
+  try {
+    await send({ type: 'analysis', analysis });
+    await send({
+      type: 'start',
+      total: analysis.urls.length,
+      checkable: analysis.summary.checkable
+    });
 
-  if (!res.writableEnded) res.end();
+    const counts = { ok: 0, warn: 0, dead: 0, error: 0, skipped: 0 };
+    let completed = 0;
+
+    await runChecks(analysis.urls, options, {
+      shouldStop: () => !connected,
+      onResult(result) {
+        counts[result.level] = (counts[result.level] ?? 0) + 1;
+        completed += 1;
+        return send({
+          type: 'result',
+          result,
+          progress: { completed, total: analysis.urls.length, counts }
+        });
+      }
+    });
+
+    await send({
+      type: 'done',
+      progress: { completed, total: analysis.urls.length, counts },
+      summary: { ...analysis.summary, ...counts }
+    });
+
+    if (compressor) {
+      if (!compressor.destroyed) compressor.end();
+      await completion;
+    } else if (!res.writableEnded) {
+      res.end();
+    }
+  } finally {
+    compressor?.destroy();
+  }
 }
 
 async function serveStatic(req, res) {
@@ -234,12 +338,21 @@ async function serveStatic(req, res) {
     throw new HttpError(404, 'Not Found');
   }
 
-  res.writeHead(200, {
+  const headers = {
     ...SECURITY_HEADERS,
     'content-type': MIME_TYPES[extname(filePath)] ?? 'application/octet-stream',
-    'cache-control': 'no-store',
-    'content-length': data.length
-  });
+    'cache-control': cacheControlForStatic(relative),
+    vary: 'Accept-Encoding'
+  };
+
+  const encoding = selectEncoding(req.headers['accept-encoding'], data.length < 1024);
+  if (encoding) {
+    data = await compressBody(data, encoding);
+    headers['content-encoding'] = encoding;
+  }
+
+  headers['content-length'] = data.length;
+  res.writeHead(200, headers);
 
   if (req.method === 'HEAD') {
     res.end();
@@ -255,10 +368,12 @@ export function createApp() {
     }
 
     try {
+      // Negotiate before routing so error responses also have an acceptable representation.
+      selectEncoding(req.headers['accept-encoding']);
       const url = new URL(req.url, 'http://localhost');
 
       if (req.method === 'GET' && url.pathname === '/api/health') {
-        sendJson(res, 200, { ok: true, mode: DEPLOYED ? 'deployed' : 'local' });
+        await sendJson(req, res, 200, { ok: true, mode: DEPLOYED ? 'deployed' : 'local' });
         return;
       }
 
@@ -282,18 +397,23 @@ export function createApp() {
         return;
       }
 
-      sendJson(res, 405, { error: 'Method Not Allowed' });
+      await sendJson(req, res, 405, { error: 'Method Not Allowed' });
     } catch (error) {
       if (res.headersSent) {
         if (!res.writableEnded) res.end();
         return;
       }
 
+      if (error instanceof HttpError && error.status === 406) {
+        res.writeHead(406, { 'cache-control': 'no-store', vary: 'Accept-Encoding' });
+        res.end();
+        return;
+      }
       const status = error instanceof HttpError ? error.status : 500;
       const message =
         error instanceof HttpError ? error.message : 'サーバーエラーが発生しました';
       if (status === 500) console.error(error);
-      sendJson(res, status, { error: message });
+      await sendJson(req, res, status, { error: message });
     }
   });
 }
