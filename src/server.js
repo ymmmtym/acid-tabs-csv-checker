@@ -2,8 +2,13 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
+import { brotliCompress, gzip } from 'node:zlib';
 import { analyzeCsv } from './parse.js';
 import { runChecks } from './check.js';
+
+const gzipAsync = promisify(gzip);
+const brotliCompressAsync = promisify(brotliCompress);
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -30,6 +35,29 @@ const SECURITY_HEADERS = {
     "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 };
 
+function cacheControlForStatic(relativePath) {
+  if (relativePath === 'index.html') return 'no-store';
+  if (relativePath === 'app.js' || relativePath === 'styles.css') {
+    return 'public, max-age=86400, immutable';
+  }
+  if (relativePath === 'favicon.svg') {
+    return 'public, max-age=31536000, immutable';
+  }
+  return 'no-store';
+}
+
+function selectEncoding(acceptEncoding = '') {
+  if (/\bbr\b/i.test(acceptEncoding)) return 'br';
+  if (/\bgzip\b/i.test(acceptEncoding)) return 'gzip';
+  return null;
+}
+
+async function compressBody(body, encoding) {
+  if (encoding === 'br') return brotliCompressAsync(body);
+  if (encoding === 'gzip') return gzipAsync(body);
+  return body;
+}
+
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -37,14 +65,24 @@ class HttpError extends Error {
   }
 }
 
-function sendJson(res, status, payload) {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
+async function sendJson(req, res, status, payload) {
+  const json = JSON.stringify(payload);
+  let body = Buffer.from(json);
+  const headers = {
     ...SECURITY_HEADERS,
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
-    'content-length': Buffer.byteLength(body)
-  });
+    vary: 'Accept-Encoding'
+  };
+
+  const encoding = body.length >= 1024 ? selectEncoding(req.headers['accept-encoding']) : null;
+  if (encoding) {
+    body = await compressBody(body, encoding);
+    headers['content-encoding'] = encoding;
+  }
+
+  headers['content-length'] = body.length;
+  res.writeHead(status, headers);
   res.end(body);
 }
 
@@ -123,7 +161,7 @@ function requireCsv(body) {
 async function handleAnalyze(req, res) {
   const body = await readJson(req);
   const analysis = analyzeCsv(requireCsv(body));
-  sendJson(res, 200, { analysis });
+  await sendJson(req, res, 200, { analysis });
 }
 
 async function handleCheck(req, res) {
@@ -136,15 +174,30 @@ async function handleCheck(req, res) {
     connected = false;
   });
 
-  res.writeHead(200, {
+  const encoding = selectEncoding(req.headers['accept-encoding']);
+  const headers = {
     ...SECURITY_HEADERS,
     'content-type': 'application/x-ndjson; charset=utf-8',
-    'cache-control': 'no-store'
-  });
+    'cache-control': 'no-store',
+    vary: 'Accept-Encoding'
+  };
+
+  let out = res;
+  let compressor = null;
+  if (encoding) {
+    const { createBrotliCompress, createGzip } = await import('node:zlib');
+    compressor = encoding === 'br' ? createBrotliCompress() : createGzip();
+    headers['content-encoding'] = encoding;
+    res.writeHead(200, headers);
+    compressor.pipe(res);
+    out = compressor;
+  } else {
+    res.writeHead(200, headers);
+  }
 
   const send = (payload) => {
     if (!connected || res.writableEnded) return;
-    res.write(`${JSON.stringify(payload)}\n`);
+    out.write(`${JSON.stringify(payload)}\n`);
   };
 
   send({ type: 'analysis', analysis });
@@ -176,7 +229,13 @@ async function handleCheck(req, res) {
     summary: { ...analysis.summary, ...counts }
   });
 
-  if (!res.writableEnded) res.end();
+  if (compressor) {
+    await new Promise((resolvePromise) => {
+      compressor.end(resolvePromise);
+    });
+  } else if (!res.writableEnded) {
+    res.end();
+  }
 }
 
 async function serveStatic(req, res) {
@@ -196,12 +255,21 @@ async function serveStatic(req, res) {
     throw new HttpError(404, 'Not Found');
   }
 
-  res.writeHead(200, {
+  const headers = {
     ...SECURITY_HEADERS,
     'content-type': MIME_TYPES[extname(filePath)] ?? 'application/octet-stream',
-    'cache-control': 'no-store',
-    'content-length': data.length
-  });
+    'cache-control': cacheControlForStatic(relative),
+    vary: 'Accept-Encoding'
+  };
+
+  const encoding = data.length >= 1024 ? selectEncoding(req.headers['accept-encoding']) : null;
+  if (encoding) {
+    data = await compressBody(data, encoding);
+    headers['content-encoding'] = encoding;
+  }
+
+  headers['content-length'] = data.length;
+  res.writeHead(200, headers);
 
   if (req.method === 'HEAD') {
     res.end();
@@ -220,7 +288,7 @@ export function createApp() {
       const url = new URL(req.url, 'http://localhost');
 
       if (req.method === 'GET' && url.pathname === '/api/health') {
-        sendJson(res, 200, { ok: true, mode: DEPLOYED ? 'deployed' : 'local' });
+        await sendJson(req, res, 200, { ok: true, mode: DEPLOYED ? 'deployed' : 'local' });
         return;
       }
 
@@ -239,7 +307,7 @@ export function createApp() {
         return;
       }
 
-      sendJson(res, 405, { error: 'Method Not Allowed' });
+      await sendJson(req, res, 405, { error: 'Method Not Allowed' });
     } catch (error) {
       if (res.headersSent) {
         if (!res.writableEnded) res.end();
@@ -250,7 +318,7 @@ export function createApp() {
       const message =
         error instanceof HttpError ? error.message : 'サーバーエラーが発生しました';
       if (status === 500) console.error(error);
-      sendJson(res, status, { error: message });
+      await sendJson(req, res, status, { error: message });
     }
   });
 }
