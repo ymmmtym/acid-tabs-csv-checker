@@ -3,7 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { brotliCompress, gzip } from 'node:zlib';
+import { brotliCompress, gzip, createBrotliCompress, createGzip, constants } from 'node:zlib';
+import { finished } from 'node:stream';
 import { analyzeCsv } from './parse.js';
 import { runChecks } from './check.js';
 
@@ -37,19 +38,39 @@ const SECURITY_HEADERS = {
 
 function cacheControlForStatic(relativePath) {
   if (relativePath === 'index.html') return 'no-store';
-  if (relativePath === 'app.js' || relativePath === 'styles.css') {
-    return 'public, max-age=86400, immutable';
-  }
-  if (relativePath === 'favicon.svg') {
+  // Only content hashes in the pathname make an asset immutable.
+  if (/[.-][a-f0-9]{8,}\.(?:js|css|svg|ico)$/i.test(relativePath)) {
     return 'public, max-age=31536000, immutable';
+  }
+  if (['.js', '.css', '.svg', '.ico'].includes(extname(relativePath))) {
+    return 'public, no-cache';
   }
   return 'no-store';
 }
 
-function selectEncoding(acceptEncoding = '') {
-  if (/\bbr\b/i.test(acceptEncoding)) return 'br';
-  if (/\bgzip\b/i.test(acceptEncoding)) return 'gzip';
-  return null;
+function selectEncoding(acceptEncoding = '', preferIdentity = false) {
+  const weights = new Map();
+  for (const part of acceptEncoding.split(',')) {
+    const match = /^\s*([!#$%&'*+.^_`|~0-9a-z-]+)\s*(?:;\s*q\s*=\s*(0(?:\.\d{0,3})?|1(?:\.0{0,3})?))?\s*$/i.exec(part);
+    if (!match) continue;
+    const coding = match[1].toLowerCase();
+    const weight = match[2] === undefined ? 1 : Number(match[2]);
+    weights.set(coding, Math.max(weights.get(coding) ?? 0, weight));
+  }
+  const identityWeight = weights.get('identity') ?? (weights.get('*') === 0 ? 0 : 1);
+  if (preferIdentity && identityWeight > 0 && !weights.has('identity')) return null;
+
+  let encoding = null;
+  let best = weights.get('identity') ?? 0;
+  for (const coding of ['br', 'gzip']) {
+    const weight = weights.get(coding) ?? weights.get('*') ?? 0;
+    if (weight > best) {
+      encoding = coding;
+      best = weight;
+    }
+  }
+  if (best > 0 || identityWeight > 0) return encoding;
+  throw new HttpError(406, 'Not Acceptable');
 }
 
 async function compressBody(body, encoding) {
@@ -75,7 +96,7 @@ async function sendJson(req, res, status, payload) {
     vary: 'Accept-Encoding'
   };
 
-  const encoding = body.length >= 1024 ? selectEncoding(req.headers['accept-encoding']) : null;
+  const encoding = selectEncoding(req.headers['accept-encoding'], body.length < 1024);
   if (encoding) {
     body = await compressBody(body, encoding);
     headers['content-encoding'] = encoding;
@@ -169,11 +190,6 @@ async function handleCheck(req, res) {
   const analysis = analyzeCsv(requireCsv(body));
   const options = sanitizeOptions(body.options);
 
-  let connected = true;
-  res.on('close', () => {
-    connected = false;
-  });
-
   const encoding = selectEncoding(req.headers['accept-encoding']);
   const headers = {
     ...SECURITY_HEADERS,
@@ -184,11 +200,26 @@ async function handleCheck(req, res) {
 
   let out = res;
   let compressor = null;
+  let completion;
+  let connected = true;
+  res.on('close', () => {
+    connected = false;
+    if (!res.writableFinished) compressor?.destroy();
+  });
   if (encoding) {
-    const { createBrotliCompress, createGzip } = await import('node:zlib');
     compressor = encoding === 'br' ? createBrotliCompress() : createGzip();
     headers['content-encoding'] = encoding;
     res.writeHead(200, headers);
+    completion = new Promise((resolvePromise) => {
+      const cleanup = finished(compressor, (error) => {
+        cleanup();
+        if (error) {
+          connected = false;
+          res.destroy();
+        }
+        resolvePromise();
+      });
+    });
     compressor.pipe(res);
     out = compressor;
   } else {
@@ -198,43 +229,47 @@ async function handleCheck(req, res) {
   const send = (payload) => {
     if (!connected || res.writableEnded) return;
     out.write(`${JSON.stringify(payload)}\n`);
+    compressor?.flush(encoding === 'br' ? constants.BROTLI_OPERATION_FLUSH : constants.Z_SYNC_FLUSH);
   };
 
-  send({ type: 'analysis', analysis });
-  send({
-    type: 'start',
-    total: analysis.urls.length,
-    checkable: analysis.summary.checkable
-  });
-
-  const counts = { ok: 0, warn: 0, dead: 0, error: 0, skipped: 0 };
-  let completed = 0;
-
-  await runChecks(analysis.urls, options, {
-    shouldStop: () => !connected,
-    onResult(result) {
-      counts[result.level] = (counts[result.level] ?? 0) + 1;
-      completed += 1;
-      send({
-        type: 'result',
-        result,
-        progress: { completed, total: analysis.urls.length, counts }
-      });
-    }
-  });
-
-  send({
-    type: 'done',
-    progress: { completed, total: analysis.urls.length, counts },
-    summary: { ...analysis.summary, ...counts }
-  });
-
-  if (compressor) {
-    await new Promise((resolvePromise) => {
-      compressor.end(resolvePromise);
+  try {
+    send({ type: 'analysis', analysis });
+    send({
+      type: 'start',
+      total: analysis.urls.length,
+      checkable: analysis.summary.checkable
     });
-  } else if (!res.writableEnded) {
-    res.end();
+
+    const counts = { ok: 0, warn: 0, dead: 0, error: 0, skipped: 0 };
+    let completed = 0;
+
+    await runChecks(analysis.urls, options, {
+      shouldStop: () => !connected,
+      onResult(result) {
+        counts[result.level] = (counts[result.level] ?? 0) + 1;
+        completed += 1;
+        send({
+          type: 'result',
+          result,
+          progress: { completed, total: analysis.urls.length, counts }
+        });
+      }
+    });
+
+    send({
+      type: 'done',
+      progress: { completed, total: analysis.urls.length, counts },
+      summary: { ...analysis.summary, ...counts }
+    });
+
+    if (compressor) {
+      if (!compressor.destroyed) compressor.end();
+      await completion;
+    } else if (!res.writableEnded) {
+      res.end();
+    }
+  } finally {
+    compressor?.destroy();
   }
 }
 
@@ -262,7 +297,7 @@ async function serveStatic(req, res) {
     vary: 'Accept-Encoding'
   };
 
-  const encoding = data.length >= 1024 ? selectEncoding(req.headers['accept-encoding']) : null;
+  const encoding = selectEncoding(req.headers['accept-encoding'], data.length < 1024);
   if (encoding) {
     data = await compressBody(data, encoding);
     headers['content-encoding'] = encoding;
@@ -285,6 +320,8 @@ export function createApp() {
     }
 
     try {
+      // Negotiate before routing so error responses also have an acceptable representation.
+      selectEncoding(req.headers['accept-encoding']);
       const url = new URL(req.url, 'http://localhost');
 
       if (req.method === 'GET' && url.pathname === '/api/health') {
@@ -314,6 +351,11 @@ export function createApp() {
         return;
       }
 
+      if (error instanceof HttpError && error.status === 406) {
+        res.writeHead(406, { 'cache-control': 'no-store', vary: 'Accept-Encoding' });
+        res.end();
+        return;
+      }
       const status = error instanceof HttpError ? error.status : 500;
       const message =
         error instanceof HttpError ? error.message : 'サーバーエラーが発生しました';
