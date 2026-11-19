@@ -465,3 +465,138 @@ test('runChecks waits for asynchronous result delivery before producing more res
   }
   assert.equal(seen.length, 2);
 });
+
+test('同じホストの URL でもトップページ確認は 1 回だけ行う', async () => {
+  const entries = analyzeCsv('⭐, https://a.example/x https://a.example/y, yellow').urls;
+  const requested = [];
+
+  await runChecks(entries, { dns: true, http: true, timeoutMs: 1000, concurrency: 4 }, {
+    lookup: async () => ({ address: '1.1.1.1' }),
+    fetchImpl: async (url) => {
+      requested.push(url);
+      return { status: url.endsWith('/') ? 200 : 404, body: { cancel() {} } };
+    }
+  });
+
+  assert.equal(requested.filter((url) => url === 'https://a.example/').length, 1);
+});
+
+test('www 付きの確認も同じホストで 1 回だけ行う', async () => {
+  const entries = analyzeCsv('⭐, https://b.example/x https://b.example/y, yellow').urls;
+  const requested = [];
+
+  await runChecks(entries, { dns: true, http: true, timeoutMs: 1000, concurrency: 4 }, {
+    lookup: async () => ({ address: '1.1.1.1' }),
+    fetchImpl: async (url) => {
+      requested.push(url);
+      const status = url.startsWith('https://www.') ? 200 : 404;
+      return { status, body: { cancel() {} } };
+    }
+  });
+
+  assert.equal(requested.filter((url) => url === 'https://www.b.example/x').length, 1);
+});
+
+test('重複 URL は 1 回だけ通信し、行ごとに結果を返す', async () => {
+  const entries = analyzeCsv(
+    '⭐, https://dup.example/p https://dup.example/p/, yellow'
+  ).urls;
+  let calls = 0;
+
+  const results = await runChecks(
+    entries,
+    { dns: true, http: true, timeoutMs: 1000, concurrency: 4 },
+    {
+      lookup: async () => ({ address: '1.1.1.1' }),
+      fetchImpl: async () => {
+        calls += 1;
+        return { status: 200, body: { cancel() {} } };
+      }
+    }
+  );
+
+  assert.equal(calls, 1);
+  assert.equal(results.length, 2);
+  assert.deepEqual(new Set(results.map((result) => result.id)).size, 2);
+  assert.equal(results[0].id, entries[0].id);
+  assert.equal(results[1].id, entries[1].id);
+});
+
+test('時間切れで未着手の URL はスキップとして返す', async () => {
+  const entries = analyzeCsv(
+    '⭐, https://slow1.example https://slow2.example https://slow3.example, yellow'
+  ).urls;
+
+  const results = await runChecks(
+    entries,
+    { dns: true, http: true, timeoutMs: 1000, concurrency: 1, budgetMs: 50 },
+    {
+      lookup: async () => ({ address: '1.1.1.1' }),
+      fetchImpl: (url, options) =>
+        new Promise((resolve, reject) => {
+          const bail = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          if (options.signal?.aborted) return bail();
+          options.signal?.addEventListener('abort', bail, { once: true });
+        })
+    }
+  );
+
+  assert.equal(results.length, 3);
+  // 実行中だった 1 件は中断され、残りは未チェックとして返る
+  const unfinished = results.filter((result) => /時間切れ/.test(result.detail));
+  assert.ok(unfinished.length >= 1);
+  for (const result of unfinished) {
+    assert.equal(result.level, 'skipped');
+  }
+  for (const result of results) {
+    assert.ok(result.id);
+  }
+});
+
+test('shouldStop が真になったら実行中の通信も中断する', async () => {
+  const entries = analyzeCsv('⭐, https://hang.example, yellow').urls;
+  let aborted = 0;
+
+  const started = Date.now();
+  await runChecks(entries, { dns: true, http: true, timeoutMs: 30000 }, {
+    shouldStop: () => Date.now() - started > 50,
+    lookup: async () => ({ address: '1.1.1.1' }),
+    fetchImpl: (url, options) =>
+      new Promise((resolve, reject) => {
+        const bail = () => {
+          aborted += 1;
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        };
+        if (options.signal?.aborted) return bail();
+        options.signal?.addEventListener('abort', bail, { once: true });
+      })
+  });
+
+  assert.ok(aborted > 0);
+  assert.ok(Date.now() - started < 5000);
+});
+
+test('重複 URL でも行ごとのカテゴリと表記を保持する', async () => {
+  const entries = analyzeCsv(
+    '⭐, https://same.example/p, yellow\n🎯, https://same.example/p/, blue'
+  ).urls;
+  let calls = 0;
+
+  const results = await runChecks(
+    entries,
+    { dns: true, http: true, timeoutMs: 1000, concurrency: 2 },
+    {
+      lookup: async () => ({ address: '1.1.1.1' }),
+      fetchImpl: async () => {
+        calls += 1;
+        return { status: 200, body: { cancel() {} } };
+      }
+    }
+  );
+
+  assert.equal(calls, 1);
+  assert.equal(results[0].category, '⭐');
+  assert.equal(results[1].category, '🎯');
+  assert.equal(results[0].raw, 'https://same.example/p');
+  assert.equal(results[1].raw, 'https://same.example/p/');
+});

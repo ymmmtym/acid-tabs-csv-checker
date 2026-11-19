@@ -7,6 +7,31 @@ import {
 } from './ssrf.js';
 
 const USER_AGENT = 'acid-tabs-checker (local, stateless)';
+
+// 応答しないホストを待ち続けると、その分だけ関数の実行時間（＝課金対象）が延びる
+const DEFAULT_TIMEOUT_MS = 5000;
+
+/** DNS 解決が返らない場合に実行全体を止めないための上限。 */
+function withDeadline(promise, ms) {
+  // 打ち切り後に元の Promise が失敗しても未処理の拒否にしない
+  promise.catch(() => {});
+
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(Object.assign(new Error('DNS lookup timed out'), { code: 'ETIMEOUT' }));
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** 複数の中断条件のうち、最初に成立したものを fetch の signal として使う。 */
+function combineSignals(...signals) {
+  const list = signals.filter(Boolean);
+  if (list.length === 1) return list[0];
+  return AbortSignal.any(list);
+}
+
 const MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 // HEAD と GET で挙動が異なるサーバーがあるため、疑わしいステータスでは GET で確認する
@@ -49,13 +74,17 @@ async function followRedirects(startUrl, method, context) {
     const targetHref = target.url.href;
 
     if (isIP(target.host) === 0) {
-      await resolvePublicAddresses(target.host, context.lookup);
+      // 名前解決が返らないホストでもリダイレクト追跡を止めない
+      await withDeadline(
+        resolvePublicAddresses(target.host, context.lookup),
+        context.timeoutMs ?? DEFAULT_TIMEOUT_MS
+      );
     }
 
     const response = await context.fetchImpl(targetHref, {
       method,
       redirect: 'manual',
-      signal: context.signal,
+      signal: combineSignals(context.signal, context.stopSignal),
       headers: {
         'user-agent': USER_AGENT,
         accept: 'text/html,application/xhtml+xml,*/*;q=0.8'
@@ -95,6 +124,21 @@ async function requestWithFallback(url, context) {
 
 const ROOT_PROBE_TIMEOUT_MS = 3000;
 
+/**
+ * 同一の追加確認を 1 回の実行内で共有する。
+ * 同じホストの URL が何件あっても、トップページや www の確認は 1 回で済む。
+ */
+function sharedProbe(cache, key, factory) {
+  if (!cache) return factory();
+
+  let promise = cache.get(key);
+  if (!promise) {
+    promise = factory();
+    cache.set(key, promise);
+  }
+  return promise;
+}
+
 function rootStatusNotice(status) {
   if (status === null) {
     return 'ドメインのトップページは確認できませんでした';
@@ -121,18 +165,22 @@ async function describeDomainRoot(urlString, context, timeoutMs) {
 
   if (parsed.pathname === '/' || parsed.pathname === '') return null;
 
-  let status = null;
-  try {
-    const { response } = await requestWithFallback(`${parsed.origin}/`, {
-      ...context,
-      signal: AbortSignal.timeout(Math.min(timeoutMs, ROOT_PROBE_TIMEOUT_MS))
-    });
-    status = response.status;
-  } catch {
-    // トップページの確認失敗はリンク切れ判定には影響させない
-  }
+  const rootUrl = `${parsed.origin}/`;
 
-  return rootStatusNotice(status);
+  return sharedProbe(context.probeCache, `root ${rootUrl}`, async () => {
+    let status = null;
+    try {
+      const { response } = await requestWithFallback(rootUrl, {
+        ...context,
+        signal: AbortSignal.timeout(Math.min(timeoutMs, ROOT_PROBE_TIMEOUT_MS))
+      });
+      status = response.status;
+    } catch {
+      // トップページの確認失敗はリンク切れ判定には影響させない
+    }
+
+    return rootStatusNotice(status);
+  });
 }
 
 function errorDetail(error, timeoutMs) {
@@ -180,21 +228,22 @@ async function probeWwwAlternative(urlString, context, timeoutMs) {
   const alternative = withWwwHost(urlString);
   if (!alternative) return null;
 
-  try {
-    const { response } = await requestWithFallback(alternative, {
-      ...context,
-      signal: AbortSignal.timeout(Math.min(timeoutMs, WWW_PROBE_TIMEOUT_MS))
-    });
-    return { url: alternative, status: response.status };
-  } catch {
-    // www 付きの確認失敗は元 URL の判定には影響させない
-    return { url: alternative, status: null };
-  }
+  return sharedProbe(context.probeCache, `www ${alternative}`, async () => {
+    try {
+      const { response } = await requestWithFallback(alternative, {
+        ...context,
+        signal: AbortSignal.timeout(Math.min(timeoutMs, WWW_PROBE_TIMEOUT_MS))
+      });
+      return { url: alternative, status: response.status };
+    } catch {
+      // www 付きの確認失敗は元 URL の判定には影響させない
+      return { url: alternative, status: null };
+    }
+  });
 }
 
-/** 元 URL が失敗した結果に、www 付きの確認結果を記録する。 */
-async function appendWwwNotice(result, context, timeoutMs) {
-  const probe = await probeWwwAlternative(result.url, context, timeoutMs);
+/** www 付きの確認結果を、元 URL の判定を変えずに記録する。 */
+function applyWwwProbe(result, probe) {
   if (!probe) return result;
 
   const ok = classifyHttpStatus(probe.status) === 'ok';
@@ -210,9 +259,14 @@ async function appendWwwNotice(result, context, timeoutMs) {
   return result;
 }
 
+/** 元 URL が失敗した結果に、www 付きの確認結果を記録する。 */
+async function appendWwwNotice(result, context, timeoutMs) {
+  return applyWwwProbe(result, await probeWwwAlternative(result.url, context, timeoutMs));
+}
+
 /** 1 件の URL に対して DNS / HTTP チェックを行う。 */
 export async function checkOne(entry, options, deps) {
-  const { dns, http, www = true, timeoutMs, strictPorts = false } = options;
+  const { dns, http, www = true, timeoutMs = DEFAULT_TIMEOUT_MS, strictPorts = false } = options;
   const checkWww = www !== false;
 
   const result = {
@@ -240,13 +294,19 @@ export async function checkOne(entry, options, deps) {
   const probeContext = {
     fetchImpl: deps.fetchImpl,
     lookup: deps.lookup,
-    strictPorts
+    strictPorts,
+    timeoutMs,
+    probeCache: deps.probeCache,
+    stopSignal: deps.stopSignal
   };
 
   // 接続先の検証は DNS チェックの有無にかかわらず必ず行う
   let addresses;
   try {
-    addresses = await resolvePublicAddresses(entry.host, deps.lookup);
+    addresses = await withDeadline(
+      resolvePublicAddresses(entry.host, deps.lookup),
+      timeoutMs
+    );
   } catch (error) {
     if (error instanceof BlockedTargetError) {
       result.level = 'error';
@@ -278,6 +338,7 @@ export async function checkOne(entry, options, deps) {
       fetchImpl: deps.fetchImpl,
       lookup: deps.lookup,
       strictPorts,
+      stopSignal: deps.stopSignal,
       signal: AbortSignal.timeout(timeoutMs)
     });
 
@@ -287,29 +348,22 @@ export async function checkOne(entry, options, deps) {
     result.level = classifyHttpStatus(response.status);
 
     if (result.level === 'dead') {
-      const rootNotice = await describeDomainRoot(
-        entry.url,
-        {
-          fetchImpl: deps.fetchImpl,
-          lookup: deps.lookup,
-          strictPorts
-        },
-        timeoutMs
-      );
+      // トップページと www の確認は互いに独立しているため同時に走らせる
+      const [rootNotice, wwwProbe] = await Promise.all([
+        describeDomainRoot(entry.url, probeContext, timeoutMs),
+        checkWww ? probeWwwAlternative(entry.url, probeContext, timeoutMs) : null
+      ]);
       result.detail = rootNotice
         ? `HTTP ${response.status} (リンク切れ / ${rootNotice})`
         : `HTTP ${response.status} (リンク切れ)`;
+      applyWwwProbe(result, wwwProbe);
     } else if (result.level === 'warn') {
       result.detail = `HTTP ${response.status} (アクセス制限またはサーバーエラー)`;
     } else if (result.level === 'error') {
       result.detail = `HTTP ${response.status} (サーバーエラー)`;
+      if (checkWww) await appendWwwNotice(result, probeContext, timeoutMs);
     } else {
       result.detail = `HTTP ${response.status}`;
-    }
-
-    // 元 URL が失敗している場合だけ www. 付きの応答を補足する
-    if (checkWww && (result.level === 'dead' || result.level === 'error')) {
-      await appendWwwNotice(result, probeContext, timeoutMs);
     }
   } catch (error) {
     result.http = 'fail';
@@ -330,16 +384,23 @@ export async function checkOne(entry, options, deps) {
  * hooks.onResult で完了ごとに結果を受け取れる（ストリーミング用）。
  */
 const CONCURRENCY_RAMP_STEP = 6;
+// Vercel の関数は最大 300 秒で打ち切られる。ストリームが途中で切れないよう手前で止める。
+const DEFAULT_BUDGET_MS = 240000;
+const STOP_POLL_INTERVAL_MS = 250;
 
 export async function runChecks(entries, options = {}, hooks = {}) {
   const {
     dns = true,
     http = true,
     www = true,
-    timeoutMs = 10000,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
     concurrency = 30,
+    budgetMs = DEFAULT_BUDGET_MS,
     strictPorts = process.env.APP_ENV === 'deployed' || Boolean(process.env.VERCEL)
   } = options;
+
+  const startedAt = Date.now();
+  const outOfBudget = () => budgetMs > 0 && Date.now() - startedAt >= budgetMs;
 
   const baseLookup = hooks.lookup ?? ((host) => dnsLookup(host));
 
@@ -351,12 +412,32 @@ export async function runChecks(entries, options = {}, hooks = {}) {
     return cache.get(key);
   };
 
+  // クライアントが切断したら、実行中の通信も打ち切って課金対象時間を延ばさない
+  const stop = new AbortController();
   const deps = {
     lookup,
-    fetchImpl: hooks.fetchImpl ?? globalThis.fetch
+    fetchImpl: hooks.fetchImpl ?? globalThis.fetch,
+    // トップページ / www の追加確認を 1 回の実行で共有する
+    probeCache: new Map(),
+    stopSignal: stop.signal
   };
 
   const checkOptions = { dns, http, www, timeoutMs, strictPorts };
+
+  // 同じ URL を指す行（表記ゆれ・重複）は 1 回だけ通信し、結果を複製する
+  const shared = new Map();
+  const checkShared = (entry) => {
+    if (!entry.checkable) return checkOne(entry, checkOptions, deps);
+
+    const key = entry.normalized || entry.url;
+
+    let promise = shared.get(key);
+    if (!promise) {
+      promise = checkOne(entry, checkOptions, deps);
+      shared.set(key, promise);
+    }
+    return promise;
+  };
 
   const results = new Array(entries.length);
   let cursor = 0;
@@ -366,6 +447,8 @@ export async function runChecks(entries, options = {}, hooks = {}) {
   const targetConcurrency = Math.max(1, Math.min(concurrency, entries.length || 1));
   const step = Math.max(1, Math.min(CONCURRENCY_RAMP_STEP, targetConcurrency));
   let desiredConcurrency = Math.min(step, targetConcurrency);
+
+  let watcher;
 
   await new Promise((resolve, reject) => {
     let settled = false;
@@ -385,7 +468,8 @@ export async function runChecks(entries, options = {}, hooks = {}) {
     const pump = () => {
       if (settled) return;
 
-      if (hooks.shouldStop?.()) {
+      if (hooks.shouldStop?.() || outOfBudget()) {
+        stop.abort();
         if (active === 0) finish();
         return;
       }
@@ -395,8 +479,23 @@ export async function runChecks(entries, options = {}, hooks = {}) {
         cursor += 1;
         active += 1;
 
-        checkOne(entries[index], checkOptions, deps)
-          .then(async (result) => {
+        checkShared(entries[index])
+          .then(async (shared) => {
+            // 共有した結果は行ごとに独立したコピーとして返す
+            // （カテゴリや表記は行ごとに異なるため、識別情報は元の行から取り直す）
+            const entry = entries[index];
+            const result =
+              shared.id === entry.id
+                ? shared
+                : {
+                    ...shared,
+                    id: entry.id,
+                    raw: entry.raw,
+                    host: entry.host,
+                    url: entry.url,
+                    type: entry.type,
+                    category: entry.emoji
+                  };
             results[index] = result;
             await hooks.onResult?.(result, index);
           })
@@ -416,7 +515,7 @@ export async function runChecks(entries, options = {}, hooks = {}) {
 
             if (
               active === 0 &&
-              (cursor >= entries.length || hooks.shouldStop?.())
+              (cursor >= entries.length || hooks.shouldStop?.() || outOfBudget())
             ) {
               finish();
             } else {
@@ -425,13 +524,52 @@ export async function runChecks(entries, options = {}, hooks = {}) {
           });
       }
 
-      if (active === 0 && (cursor >= entries.length || hooks.shouldStop?.())) {
+      if (active === 0 && (cursor >= entries.length || hooks.shouldStop?.() || outOfBudget())) {
         finish();
       }
     };
 
+    // 実行中の通信がすべて固まっても中断できるよう、状態を定期的に見張る
+    watcher = setInterval(() => {
+      if (settled) return;
+      if (hooks.shouldStop?.() || outOfBudget()) {
+        stop.abort();
+        if (active === 0) finish();
+      }
+    }, STOP_POLL_INTERVAL_MS);
+
     pump();
-  });
+  }).finally(() => clearInterval(watcher));
+
+  // 時間切れで着手できなかった URL は「未チェック」として明示する
+  // （new Array(n) は疎配列なので forEach では穴が飛ばされる）
+  const unfinished = [];
+  for (let index = 0; index < results.length; index += 1) {
+    if (results[index]) continue;
+    const entry = entries[index];
+    const skipped = {
+      id: entry.id,
+      raw: entry.raw,
+      host: entry.host,
+      url: entry.url,
+      type: entry.type,
+      category: entry.emoji,
+      dns: 'skipped',
+      http: 'skipped',
+      www: 'skipped',
+      wwwStatus: null,
+      wwwUrl: '',
+      status: null,
+      level: 'skipped',
+      detail: '時間切れのため未チェック（対象を絞って再実行してください）'
+    };
+    results[index] = skipped;
+    unfinished.push([skipped, index]);
+  }
+
+  for (const [skipped, index] of unfinished) {
+    await hooks.onResult?.(skipped, index);
+  }
 
   return results;
 }
