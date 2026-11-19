@@ -193,7 +193,7 @@ function sanitizeOptions(raw = {}) {
     dns,
     http,
     www,
-    timeoutMs: clampInt(raw.timeoutMs, 1000, 30000, 10000),
+    timeoutMs: clampInt(raw.timeoutMs, 1000, 30000, 5000),
     concurrency: clampInt(raw.concurrency, 1, 30, 30),
     // 公開環境では 80/443 以外への接続を許可しない
     strictPorts: DEPLOYED

@@ -177,3 +177,6 @@ dist
 
 # Vercel
 .vercel/
+
+# Agent memory (local only)
+.openhands/
