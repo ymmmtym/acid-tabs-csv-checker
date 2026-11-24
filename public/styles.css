@@ -890,6 +890,29 @@ h2 {
   font-size: 0.8rem;
 }
 
+.site-footer p {
+  margin: 0 0 0.5rem;
+}
+
+.site-footer-links {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.site-footer-links a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
+}
+
+.site-footer-links a:hover,
+.site-footer-links a:focus-visible {
+  color: var(--primary);
+  text-decoration-color: currentColor;
+}
+
 @media (max-width: 640px) {
   .card {
     padding: 1rem;
