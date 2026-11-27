@@ -1,6 +1,7 @@
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { isDeployed } from './config.js';
+import { daysUntil, describeRdap, lookupRdap, registrableDomain } from './rdap.js';
 import {
   BlockedTargetError,
   assertHttpUrl,
@@ -224,6 +225,41 @@ async function describeDomainRoot(urlString, context, timeoutMs) {
   });
 }
 
+/**
+ * DNS 解決に失敗したドメインだけ、登録情報（有効期限）を RDAP で確認する。
+ * 同じ登録ドメインの URL が何件あっても問い合わせは 1 回に共有する。
+ */
+async function probeRdap(host, context) {
+  if (context.stopSignal?.aborted) return null;
+
+  const domain = registrableDomain(host);
+  if (!domain) return null;
+
+  return sharedProbe(context.probeCache, `rdap ${domain}`, () =>
+    lookupRdap(domain, { fetchImpl: context.rdapFetchImpl })
+  );
+}
+
+/**
+ * RDAP の確認結果を detail に追記する。
+ * 期限切れ間近のときだけ level を warn に上げる（元の error は下げない）。
+ */
+function applyRdapNotice(result, probe) {
+  if (!probe) return result;
+
+  if (!probe.ok) {
+    result.detail = `${result.detail} / ${probe.reason}`;
+    return result;
+  }
+
+  result.detail = `${result.detail} / ${describeRdap(probe)}`;
+  if (probe.expiration) {
+    result.expiration = probe.expiration;
+    if (daysUntil(probe.expiration) <= 30) result.level = 'warn';
+  }
+  return result;
+}
+
 function errorDetail(error, timeoutMs) {
   if (error instanceof BlockedTargetError) {
     return `ブロック: ${error.message}`;
@@ -343,8 +379,16 @@ async function appendWwwNotice(result, context, timeoutMs) {
 
 /** 1 件の URL に対して DNS / HTTP チェックを行う。 */
 export async function checkOne(entry, options, deps) {
-  const { dns, http, www = true, timeoutMs = DEFAULT_TIMEOUT_MS, strictPorts = false } = options;
+  const {
+    dns,
+    http,
+    www = true,
+    rdap = false,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    strictPorts = false
+  } = options;
   const checkWww = www !== false;
+  const checkRdap = rdap === true;
 
   const result = {
     id: entry.id,
@@ -358,6 +402,7 @@ export async function checkOne(entry, options, deps) {
     www: 'skipped',
     wwwStatus: null,
     wwwUrl: '',
+    expiration: null,
     status: null,
     level: 'skipped',
     detail: ''
@@ -371,6 +416,7 @@ export async function checkOne(entry, options, deps) {
   const probeContext = {
     fetchImpl: deps.fetchImpl,
     lookup: deps.lookup,
+    rdapFetchImpl: deps.rdapFetchImpl,
     strictPorts,
     timeoutMs,
     probeCache: deps.probeCache,
@@ -398,9 +444,13 @@ export async function checkOne(entry, options, deps) {
     if (dns) result.dns = 'fail';
     result.level = 'error';
     result.detail = `DNS 解決失敗 (${error?.code || error?.message || 'unknown'})`;
-    return checkWww
-      ? appendWwwNotice(result, probeContext, timeoutMs)
-      : result;
+
+    // 名前が引けないドメインだけ登録情報を補う（登録切れの切り分けに使う）
+    const [withWww, rdapProbe] = await Promise.all([
+      checkWww ? appendWwwNotice(result, probeContext, timeoutMs) : result,
+      checkRdap ? probeRdap(entry.host, probeContext) : null
+    ]);
+    return applyRdapNotice(withWww, rdapProbe);
   }
 
   if (dns) {
@@ -479,6 +529,7 @@ export async function runChecks(entries, options = {}, hooks = {}) {
     dns = true,
     http = true,
     www = true,
+    rdap = false,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     concurrency = 30,
     budgetMs = DEFAULT_BUDGET_MS,
@@ -503,12 +554,13 @@ export async function runChecks(entries, options = {}, hooks = {}) {
   const deps = {
     lookup,
     fetchImpl: hooks.fetchImpl ?? globalThis.fetch,
+    rdapFetchImpl: hooks.rdapFetchImpl ?? globalThis.fetch,
     // トップページ / www の追加確認を 1 回の実行で共有する
     probeCache: new Map(),
     stopSignal: stop.signal
   };
 
-  const checkOptions = { dns, http, www, timeoutMs, strictPorts };
+  const checkOptions = { dns, http, www, rdap, timeoutMs, strictPorts };
 
   // 同じ URL を指す行（表記ゆれ・重複）は 1 回だけ通信し、結果を複製する
   const shared = new Map();

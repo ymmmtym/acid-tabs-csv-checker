@@ -107,6 +107,7 @@ function currentOptions() {
     dns: $('#opt-dns').checked,
     http: $('#opt-http').checked,
     www: $('#opt-www').checked,
+    rdap: $('#opt-rdap').checked,
     timeoutMs: Number($('#opt-timeout').value),
     concurrency: Number($('#opt-concurrency').value)
   };
@@ -753,6 +754,7 @@ function buildReport() {
       dnsAddress: result?.dnsAddress ?? '',
       http: result?.http ?? 'pending',
       status: result?.status ?? null,
+      expiration: result?.expiration ?? null,
       level: result?.level ?? 'pending',
       detail: result?.detail ?? ''
     };
@@ -787,6 +789,7 @@ function reportCsv(report) {
     'line',
     'dns',
     'http_status',
+    'expiration',
     'duplicate',
     'detail'
   ];
@@ -798,6 +801,7 @@ function reportCsv(report) {
     url.line,
     url.dns,
     url.status ?? '',
+    url.expiration ?? '',
     url.isDuplicate ? 'yes' : 'no',
     url.detail
   ]);
@@ -882,24 +886,51 @@ function download(filename, content, type) {
   URL.revokeObjectURL(url);
 }
 
-async function applyHealthBadge() {
+let healthMode = 'local';
+
+/**
+ * プライバシーバッジを表示する。
+ * ドメイン登録情報をオンにすると外部送信が発生するため、文言もそれに合わせる。
+ */
+function renderPrivacyBadge() {
   const badge = $('#privacy-badge');
   if (!badge) return;
 
+  const rdapOn = $('#opt-rdap')?.checked === true;
+  const deployed = healthMode === 'deployed';
+
+  badge.classList.toggle('is-deployed', deployed);
+  if (rdapOn) {
+    badge.textContent = deployed
+      ? '保存しません / 公開環境・ドメイン名を外部送信'
+      : '保存しません / ドメイン名を外部送信';
+    badge.title =
+      'DNS 解決に失敗したドメイン名だけを RDAP（rdap.org）へ送信します。CSV の内容は送信しません。';
+    return;
+  }
+
+  badge.textContent = deployed
+    ? '保存しません / 公開環境で実行中'
+    : '保存しません / 外部送信なし';
+  badge.title = deployed
+    ? 'CSV はブラウザからこのサーバーへ送信されます。ディスク・DB・ブラウザストレージには保存しません。'
+    : '';
+}
+
+async function applyHealthBadge() {
+  if (!$('#privacy-badge')) return;
+
   try {
     const response = await fetch('/api/health', { cache: 'no-store' });
-    if (!response.ok) return;
-
-    const health = await response.json();
-    if (health.mode === 'deployed') {
-      badge.textContent = '保存しません / 公開環境で実行中';
-      badge.classList.add('is-deployed');
-      badge.title =
-        'CSV はブラウザからこのサーバーへ送信されます。ディスク・DB・ブラウザストレージには保存しません。';
+    if (response.ok) {
+      const health = await response.json();
+      if (health.mode === 'deployed') healthMode = 'deployed';
     }
   } catch {
     // 表示の切り替えに失敗してもアプリの動作には影響しない
   }
+
+  renderPrivacyBadge();
 }
 
 function fileTimestamp() {
@@ -1038,6 +1069,8 @@ function init() {
   const fileInput = $('#file-input');
 
   applyHealthBadge();
+
+  $('#opt-rdap')?.addEventListener('change', renderPrivacyBadge);
 
   const pastePanel = document.querySelector('.paste-panel');
   if (pastePanel) {

@@ -5,7 +5,7 @@ import { once } from 'node:events';
 import dns from 'node:dns/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { createGunzip, createBrotliDecompress, gunzipSync, brotliDecompressSync, Gzip, BrotliCompress } from 'node:zlib';
-import { createApp } from '../src/server.js';
+import { createApp, sanitizeOptions } from '../src/server.js';
 
 async function start(t) {
   const server = createApp().listen(0, '127.0.0.1');
@@ -178,3 +178,14 @@ for (const encoding of ['identity', 'gzip', 'br']) {
     assert.equal(flushes, encoding === 'identity' ? 0 : 5);
   });
 }
+
+test('RDAP は明示的に有効化したときだけ実行する', () => {
+  assert.equal(sanitizeOptions({}).rdap, false);
+  assert.equal(sanitizeOptions({ rdap: 'true' }).rdap, false);
+  assert.equal(sanitizeOptions({ rdap: 1 }).rdap, false);
+  assert.equal(sanitizeOptions({ rdap: true }).rdap, true);
+});
+
+test('RDAP を有効にしても DNS か HTTP の必須条件は変わらない', () => {
+  assert.throws(() => sanitizeOptions({ dns: false, http: false, rdap: true }), /DNS か HTTP/);
+});

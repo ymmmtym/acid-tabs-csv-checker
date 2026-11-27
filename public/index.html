@@ -129,6 +129,10 @@
             <input type="checkbox" id="opt-www" checked />
             <span>www ドメイン</span>
           </label>
+          <label class="check">
+            <input type="checkbox" id="opt-rdap" />
+            <span>ドメイン登録情報</span>
+          </label>
           <label class="select-field">
             <span>タイムアウト</span>
             <select id="opt-timeout">
@@ -152,6 +156,9 @@
         </div>
         <p class="options-note muted">
           www ドメインは元 URL が失敗した場合のみ確認します。並列数は 6 から開始し、6 件完了ごとに 6 ずつ増えて指定値（最大 30）になります。
+        </p>
+        <p class="options-note muted">
+          ドメイン登録情報をオンにすると、DNS 解決に失敗したドメインだけ、登録可能ドメインの有効期限を RDAP（<code>rdap.org</code>）に問い合わせます。このときだけ、対象ドメイン名が外部サービスへ送信されます。オフのままなら外部への問い合わせは発生しません。
         </p>
 
         <div class="actions">
