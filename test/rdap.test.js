@@ -241,7 +241,7 @@ test('DNS が成功した URL では RDAP を確認しない', async () => {
   assert.equal(result.expiration, null);
 });
 
-test('期限切れ間近なら warn に上げる', async () => {
+test('有効期限が過ぎていても URL の判定は変えない', async () => {
   const entry = analyzeCsv('⭐, expired.example.com, yellow').urls[0];
 
   const result = await checkOne(
@@ -263,6 +263,7 @@ test('期限切れ間近なら warn に上げる', async () => {
     }
   );
 
-  assert.equal(result.level, 'warn');
+  assert.equal(result.level, 'error');
+  assert.equal(result.expiration, '2020-01-01');
   assert.match(result.detail, /有効期限を過ぎています/);
 });

@@ -1,7 +1,7 @@
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { isDeployed } from './config.js';
-import { daysUntil, describeRdap, lookupRdap, registrableDomain } from './rdap.js';
+import { describeRdap, lookupRdap, registrableDomain } from './rdap.js';
 import {
   BlockedTargetError,
   assertHttpUrl,
@@ -242,7 +242,7 @@ async function probeRdap(host, context) {
 
 /**
  * RDAP の確認結果を detail に追記する。
- * 期限切れ間近のときだけ level を warn に上げる（元の error は下げない）。
+ * 登録情報は補足であり、URL 自体の到達性は変わらないため level は変更しない。
  */
 function applyRdapNotice(result, probe) {
   if (!probe) return result;
@@ -253,10 +253,7 @@ function applyRdapNotice(result, probe) {
   }
 
   result.detail = `${result.detail} / ${describeRdap(probe)}`;
-  if (probe.expiration) {
-    result.expiration = probe.expiration;
-    if (daysUntil(probe.expiration) <= 30) result.level = 'warn';
-  }
+  if (probe.expiration) result.expiration = probe.expiration;
   return result;
 }
 
