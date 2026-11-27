@@ -24,6 +24,7 @@ Acid Tabs の CSV エクスポートを検証する、ステートレスな Web 
 - `src/check.js` — DNS 解決と HTTP チェック、並列処理、ストリーミング用フック、最大 5 ホップの手動リダイレクト追跡
 - `src/rdap.js` — 登録可能ドメインの導出と、RDAP による有効期限の確認（オプトイン）
 - `src/ssrf.js` — URL と解決済みアドレスの検証（`BlockedTargetError`、IPv4 / IPv6 のブロックリスト）
+- `src/signals.js` — 複数の中断条件を 1 つの `AbortSignal` にまとめる（`AbortSignal.any` の代替実装を含む）
 - `src/config.js` — 公開環境かどうかの判定（`isDeployed`）
 - `public/index.html`、`public/app.js`、`public/styles.css` — Vanilla JS によるフロントエンド。状態はメモリ上だけに保持
 - `public/clean.js` — クリーンアップ後の Acid Tabs CSV を生成する純粋関数（DOM に依存しない）
@@ -52,6 +53,8 @@ emoji, space-separated-urls, color
 - `rdap` オプション（既定オフ）をオンにした場合だけ、**DNS 解決に失敗したドメイン**について、登録可能ドメイン（eTLD+1）の有効期限を `https://rdap.org/domain/<domain>` へ問い合わせます。`www` と同様に SSRF の検証を通し、タイムアウトは 4 秒です。同じ登録ドメインの問い合わせは 1 回の実行で共有します。
 - RDAP で取得するのは有効期限・登録日・ステータスだけです。登録者名や連絡先は取り出さず、画面にもレポートにも出しません。
 - RDAP の結果は `level` を変えません。登録情報は補足であり、URL の到達性ではないためです。期限切れ間近かどうかは `detail` の文言だけで示します。
+- RDAP のリダイレクトは `redirect: 'manual'` で手動追跡し、各ホップで HTTPS であることと接続先が公開アドレスであることを検証します（最大 3 ホップ）。`rdap.org` は登録機関の RDAP サーバーへ転送し、その転送先にもドメイン名が渡るためです。
+- RDAP の問い合わせには実行の中断 signal（`context.stopSignal`）を渡します。クライアント切断後も 4 秒の待ち時間が残らないようにするためです。
 - `.jp` / `.de` / `.io` など RDAP 非対応の TLD と、未登録ドメインは区別して表示します。
 - 同じ URL を指す行（表記ゆれ・重複）は 1 回だけ通信し、結果は行ごとに複製して返します。カテゴリや表記は行ごとの値を保持します。共有の単位はスキーム・ホスト・ポート・パス・クエリで判定し、`http` と `https`、ポート違いは別々に確認します。
 - 同じホストのトップページ確認と `www` 確認は、1 回の実行内で共有します（`probeCache`）。

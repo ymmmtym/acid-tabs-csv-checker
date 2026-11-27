@@ -1,5 +1,7 @@
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
-import { assertHttpUrl } from './ssrf.js';
+import { combineSignals } from './signals.js';
+import { BlockedTargetError, assertHttpUrl, resolvePublicAddresses } from './ssrf.js';
 
 /**
  * 登録可能ドメイン（eTLD+1）の導出に使う 2 段階サフィックス。
@@ -106,25 +108,84 @@ const RDAP_ENDPOINT = 'https://rdap.org/domain/';
 const RDAP_TIMEOUT_MS = 4000;
 // rdap.org は User-Agent の無い要求を 403 で拒否する
 const RDAP_USER_AGENT = 'acid-tabs-checker (stateless csv checker)';
+const RDAP_MAX_REDIRECTS = 3;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+function headerValue(response, name) {
+  const headers = response?.headers;
+  if (!headers) return null;
+  if (typeof headers.get === 'function') return headers.get(name);
+  return headers[name] ?? headers[name.toLowerCase()] ?? null;
+}
+
+async function discardBody(response) {
+  try {
+    await response?.body?.cancel?.();
+  } catch {
+    // 破棄できなくても結果には影響しない
+  }
+}
+
+/**
+ * RDAP のリダイレクトを手動で追跡する。
+ * rdap.org はドメイン名を含む URL を登録機関の RDAP サーバーへ 302 で転送するため、
+ * 各ホップでスキームと接続先を検証する（`redirect: 'follow'` では検証できない）。
+ */
+async function fetchRdap(url, context) {
+  let currentUrl = url;
+
+  for (let hop = 0; hop <= RDAP_MAX_REDIRECTS; hop += 1) {
+    const target = assertHttpUrl(currentUrl);
+    // 転送先にもドメイン名が渡るため、平文の http への降格は許可しない
+    if (target.url.protocol !== 'https:') {
+      throw new BlockedTargetError('RDAP の転送先が HTTPS ではありません');
+    }
+
+    if (isIP(target.host) === 0) {
+      await resolvePublicAddresses(target.host, context.lookup);
+    }
+
+    const response = await context.fetchImpl(target.url.href, {
+      redirect: 'manual',
+      signal: context.signal,
+      headers: {
+        accept: 'application/rdap+json, application/json',
+        'user-agent': RDAP_USER_AGENT
+      }
+    });
+
+    if (!REDIRECT_STATUSES.has(response.status)) return response;
+
+    const location = headerValue(response, 'location');
+    await discardBody(response);
+    if (!location) return response;
+    if (hop === RDAP_MAX_REDIRECTS) {
+      throw new BlockedTargetError('RDAP のリダイレクト回数が上限を超えました');
+    }
+
+    currentUrl = new URL(location, target.url.href).href;
+  }
+
+  throw new BlockedTargetError('RDAP のリダイレクト回数が上限を超えました');
+}
 
 /**
  * 登録可能ドメインの有効期限を RDAP で確認する。
  * 失敗しても例外は投げず、確認できなかった理由を返す。
  */
-export async function lookupRdap(domain, { fetchImpl, timeoutMs = RDAP_TIMEOUT_MS } = {}) {
+export async function lookupRdap(
+  domain,
+  { fetchImpl, lookup, timeoutMs = RDAP_TIMEOUT_MS, signal } = {}
+) {
   const url = `${RDAP_ENDPOINT}${encodeURIComponent(domain)}`;
 
-  // 問い合わせ先は固定だが、リダイレクト先も含めて SSRF の検証を通す
-  const { url: safeUrl } = assertHttpUrl(url);
-
   try {
-    const response = await (fetchImpl ?? globalThis.fetch)(safeUrl.href, {
-      redirect: 'follow',
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        accept: 'application/rdap+json, application/json',
-        'user-agent': RDAP_USER_AGENT
-      }
+    const response = await fetchRdap(url, {
+      fetchImpl: fetchImpl ?? globalThis.fetch,
+      // resolvePublicAddresses は { all: true } で全アドレスを検証するため、lookup をそのまま渡す
+      lookup: lookup ?? dnsLookup,
+      // 実行の中断（クライアント切断・予算超過）でも RDAP の待ち時間を残さない
+      signal: combineSignals(signal, AbortSignal.timeout(timeoutMs))
     });
 
     if (response.status === 404) {
@@ -151,6 +212,9 @@ export async function lookupRdap(domain, { fetchImpl, timeoutMs = RDAP_TIMEOUT_M
 
     return { ok: true, ...summary };
   } catch (error) {
+    if (error instanceof BlockedTargetError) {
+      return { ok: false, reason: `RDAP の接続先を拒否しました (${error.message})` };
+    }
     if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
       return { ok: false, reason: 'RDAP がタイムアウトしました' };
     }

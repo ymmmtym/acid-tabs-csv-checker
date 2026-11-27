@@ -1,4 +1,5 @@
 import { buildCleanedCsv } from './clean.js';
+import { privacyBadge } from './privacy-badge.js';
 import { attachResultKeyboardNavigation } from './result-keyboard.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -17,7 +18,9 @@ const state = {
   filter: 'all',
   search: '',
   runId: 0,
-  focusedRowIndex: -1
+  focusedRowIndex: -1,
+  // 実行中のチェック条件。バッジはこの値だけを見て外部送信の有無を表示する
+  runOptions: null
 };
 
 const LEVEL_LABELS = {
@@ -549,10 +552,12 @@ async function loadCsv(text, name) {
   state.bom = text.charCodeAt(0) === 0xfeff;
   state.finished = false;
   state.running = false;
+  state.runOptions = null;
   state.filter = 'all';
   state.search = '';
   $('#search').value = '';
   clearAlert();
+  renderPrivacyBadge();
 
   $('#results-card').classList.add('hidden');
   $('#issues-card').classList.add('hidden');
@@ -608,6 +613,7 @@ async function startCheck() {
   state.running = true;
   state.finished = false;
   state.abort = new AbortController();
+  state.runOptions = options;
   const runId = ++state.runId;
   clearAlert();
 
@@ -671,6 +677,8 @@ async function startCheck() {
     if (state.runId === runId) {
       state.running = false;
       state.abort = null;
+      state.runOptions = null;
+      renderPrivacyBadge();
       $('#start-btn').disabled = false;
       $('#cancel-btn').classList.add('hidden');
       $('#downloads')
@@ -719,9 +727,11 @@ function reset() {
   state.bom = false;
   state.running = false;
   state.finished = false;
+  state.runOptions = null;
   state.filter = 'all';
   state.search = '';
   clearAlert();
+  renderPrivacyBadge();
   showCopyStatus('');
   updateSelectionUi();
   $('#file-input').value = '';
@@ -896,25 +906,15 @@ function renderPrivacyBadge() {
   const badge = $('#privacy-badge');
   if (!badge) return;
 
-  const rdapOn = $('#opt-rdap')?.checked === true;
+  // 実行中は送信済みの条件で表示する。途中でチェックを外しても、
+  // 実際に走っている実行が送信を続けている間は「外部送信なし」と表示しない。
+  const rdapOn = state.runOptions ? state.runOptions.rdap === true : $('#opt-rdap')?.checked === true;
   const deployed = healthMode === 'deployed';
 
   badge.classList.toggle('is-deployed', deployed);
-  if (rdapOn) {
-    badge.textContent = deployed
-      ? '保存しません / 公開環境・ドメイン名を外部送信'
-      : '保存しません / ドメイン名を外部送信';
-    badge.title =
-      'DNS 解決に失敗したドメイン名だけを RDAP（rdap.org）へ送信します。CSV の内容は送信しません。';
-    return;
-  }
-
-  badge.textContent = deployed
-    ? '保存しません / 公開環境で実行中'
-    : '保存しません / 外部送信なし';
-  badge.title = deployed
-    ? 'CSV はブラウザからこのサーバーへ送信されます。ディスク・DB・ブラウザストレージには保存しません。'
-    : '';
+  const { text, title } = privacyBadge({ rdap: rdapOn, deployed });
+  badge.textContent = text;
+  badge.title = title;
 }
 
 async function applyHealthBadge() {

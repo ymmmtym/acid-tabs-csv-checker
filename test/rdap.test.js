@@ -164,7 +164,9 @@ test('DNS 失敗時のみ RDAP を確認し、結果に有効期限を足す', a
     entry,
     { dns: true, http: true, rdap: true, timeoutMs: 1000 },
     {
-      lookup: async () => {
+      // チェック対象は引けないが、RDAP の接続先は引ける状況
+      lookup: async (host) => {
+        if (host === 'rdap.org') return { address: '199.19.117.1', family: 4 };
         const error = new Error('not found');
         error.code = 'ENOTFOUND';
         throw error;
@@ -248,7 +250,8 @@ test('有効期限が過ぎていても URL の判定は変えない', async () 
     entry,
     { dns: true, http: true, rdap: true, timeoutMs: 1000 },
     {
-      lookup: async () => {
+      lookup: async (host) => {
+        if (host === 'rdap.org') return { address: '199.19.117.1', family: 4 };
         throw Object.assign(new Error('not found'), { code: 'ENOTFOUND' });
       },
       fetchImpl: async () => ({ status: 200, body: { cancel() {} } }),
@@ -266,4 +269,125 @@ test('有効期限が過ぎていても URL の判定は変えない', async () 
   assert.equal(result.level, 'error');
   assert.equal(result.expiration, '2020-01-01');
   assert.match(result.detail, /有効期限を過ぎています/);
+});
+
+// RDAP は登録機関のサーバーへ転送されるため、各ホップを検証する
+const publicLookup = async (host) => {
+  if (host === 'rdap.org') return { address: '199.19.117.1', family: 4 };
+  if (host === 'rdap.verisign.com') return { address: '199.19.117.2', family: 4 };
+  return { address: '93.184.216.34', family: 4 };
+};
+
+const rdapPayload = {
+  ok: true,
+  status: 200,
+  json: async () => ({
+    ldhName: 'EXAMPLE.COM',
+    events: [{ eventAction: 'expiration', eventDate: '2027-08-13T04:00:00Z' }]
+  })
+};
+
+test('RDAP の転送を手動で追跡し、転送先にも User-Agent を送る', async () => {
+  const calls = [];
+  const result = await lookupRdap('example.com', {
+    lookup: publicLookup,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, redirect: options.redirect, ua: options.headers['user-agent'] });
+      if (calls.length === 1) {
+        return {
+          status: 302,
+          headers: new Map([['location', 'https://rdap.verisign.com/com/v1/domain/example.com']]),
+          body: { cancel() {} }
+        };
+      }
+      return rdapPayload;
+    }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.expiration, '2027-08-13');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].redirect, 'manual');
+  assert.match(calls[0].url, /rdap\.org/);
+  assert.match(calls[1].url, /rdap\.verisign\.com/);
+  assert.match(calls[1].ua, /acid-tabs-checker/);
+});
+
+test('RDAP の転送先が http なら拒否する', async () => {
+  let requested = 0;
+  const result = await lookupRdap('example.com', {
+    lookup: publicLookup,
+    fetchImpl: async () => {
+      requested += 1;
+      return {
+        status: 302,
+        headers: new Map([['location', 'http://rdap.verisign.com/com/v1/domain/example.com']]),
+        body: { cancel() {} }
+      };
+    }
+  });
+
+  // 平文の転送先は要求しない
+  assert.equal(requested, 1);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /HTTPS ではありません/);
+});
+
+test('RDAP の転送先がプライベートアドレスなら拒否する', async () => {
+  let requested = 0;
+  const result = await lookupRdap('example.com', {
+    lookup: async (host) => {
+      if (host === 'rdap.org') return { address: '199.19.117.1', family: 4 };
+      return { address: '10.0.0.5', family: 4 };
+    },
+    fetchImpl: async () => {
+      requested += 1;
+      return {
+        status: 302,
+        headers: new Map([['location', 'https://internal.example/domain/example.com']]),
+        body: { cancel() {} }
+      };
+    }
+  });
+
+  assert.equal(requested, 1);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /プライベート/);
+});
+
+test('RDAP の転送が上限を超えたら打ち切る', async () => {
+  let requested = 0;
+  const result = await lookupRdap('example.com', {
+    lookup: publicLookup,
+    fetchImpl: async () => {
+      requested += 1;
+      return {
+        status: 302,
+        headers: new Map([['location', 'https://rdap.verisign.com/loop']]),
+        body: { cancel() {} }
+      };
+    }
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /リダイレクト回数が上限/);
+  assert.equal(requested, 4);
+});
+
+test('実行の中断 signal で RDAP の待ち時間を打ち切る', async () => {
+  const controller = new AbortController();
+  const result = await lookupRdap('example.com', {
+    lookup: publicLookup,
+    signal: controller.signal,
+    fetchImpl: async (url, options) =>
+      new Promise((_, reject) => {
+        const fail = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        if (options.signal?.aborted) return fail();
+        options.signal?.addEventListener('abort', fail, { once: true });
+        controller.abort();
+      })
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /タイムアウト/);
 });
