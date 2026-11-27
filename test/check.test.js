@@ -681,3 +681,51 @@ test('中断済みなら www 付きの追加確認を始めない', async () => 
   assert.deepEqual(seen, []);
   assert.equal(results[0].level, 'skipped');
 });
+
+test('リダイレクト先の DNS 待ちはリクエスト期限で打ち切る', async () => {
+  const entry = {
+    id: 'u1',
+    raw: 'a.example',
+    host: 'a.example',
+    url: 'https://a.example/a',
+    type: 'domain',
+    checkable: true,
+    emoji: '⭐'
+  };
+
+  const started = Date.now();
+  const result = await checkOne(entry, { dns: true, http: true, www: false, timeoutMs: 400 }, {
+    lookup: async (host) => (host === 'b.example' ? new Promise(() => {}) : { address: '1.1.1.1' }),
+    fetchImpl: async () => ({
+      status: 302,
+      headers: { get: (name) => (name.toLowerCase() === 'location' ? 'https://b.example/b' : null) },
+      body: { cancel() {} }
+    })
+  });
+  const elapsed = Date.now() - started;
+
+  assert.equal(result.level, 'error');
+  // 期限 400ms に収まること（DNS 待ちが期限を無視すると 800ms 以上かかる）
+  assert.ok(elapsed < 700, `期限を超えて待っている: ${elapsed}ms`);
+});
+
+test('www 付きの DNS 待ちは 3 秒の上限に収める', async () => {
+  const entries = analyzeCsv('⭐, https://gone.example/p, yellow').urls;
+
+  const started = Date.now();
+  const results = await runChecks(
+    entries,
+    { dns: true, http: true, www: true, timeoutMs: 30000, concurrency: 1 },
+    {
+      lookup: async (host) => (host.startsWith('www.') ? new Promise(() => {}) : { address: '1.1.1.1' }),
+      fetchImpl: async () => {
+        throw new Error('connect ECONNREFUSED');
+      }
+    }
+  );
+  const elapsed = Date.now() - started;
+
+  assert.equal(results[0].www, 'fail');
+  // timeoutMs が 30 秒でも、www の確認は 3 秒で打ち切られる
+  assert.ok(elapsed < 5000, `www の上限を超えて待っている: ${elapsed}ms`);
+});

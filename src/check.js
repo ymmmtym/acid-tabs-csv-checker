@@ -117,7 +117,7 @@ async function followRedirects(startUrl, method, context) {
       await withDeadline(
         resolvePublicAddresses(target.host, context.lookup),
         context.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        context.stopSignal
+        combineSignals(context.signal, context.stopSignal)
       );
     }
 
@@ -273,9 +273,12 @@ async function probeWwwAlternative(urlString, context, timeoutMs) {
 
   return sharedProbe(context.probeCache, `www ${alternative}`, async () => {
     try {
+      const probeTimeout = Math.min(timeoutMs, WWW_PROBE_TIMEOUT_MS);
       const { response } = await requestWithFallback(alternative, {
         ...context,
-        signal: AbortSignal.timeout(Math.min(timeoutMs, WWW_PROBE_TIMEOUT_MS))
+        // リダイレクト追跡内の DNS 待ちも 3 秒の上限に収める
+        timeoutMs: probeTimeout,
+        signal: AbortSignal.timeout(probeTimeout)
       });
       return { url: alternative, status: response.status };
     } catch {
