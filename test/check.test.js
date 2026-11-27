@@ -543,7 +543,7 @@ test('時間切れで未着手の URL はスキップとして返す', async () 
 
   assert.equal(results.length, 3);
   // 実行中だった 1 件は中断され、残りは未チェックとして返る
-  const unfinished = results.filter((result) => /時間切れ/.test(result.detail));
+  const unfinished = results.filter((result) => /未チェック/.test(result.detail));
   assert.ok(unfinished.length >= 1);
   for (const result of unfinished) {
     assert.equal(result.level, 'skipped');
@@ -599,4 +599,85 @@ test('重複 URL でも行ごとのカテゴリと表記を保持する', async 
   assert.equal(results[1].category, '🎯');
   assert.equal(results[0].raw, 'https://same.example/p');
   assert.equal(results[1].raw, 'https://same.example/p/');
+});
+
+test('スキームとポートが異なる URL は別々に確認する', async () => {
+  const entries = analyzeCsv(
+    '⭐, https://port.example:8080/p https://port.example:8081/p http://port.example/p, yellow'
+  ).urls;
+
+  const seen = [];
+  const results = await runChecks(
+    entries,
+    { dns: true, http: true, timeoutMs: 1000, concurrency: 3 },
+    {
+      lookup: async () => ({ address: '1.1.1.1' }),
+      fetchImpl: async (url) => {
+        seen.push(url);
+        return { status: url.includes(':8081') ? 404 : 200, body: { cancel() {} } };
+      }
+    }
+  );
+
+  // 404 の行は GET 再試行とトップページ確認も走るため、対象 URL ごとに確認する
+  for (const url of [
+    'https://port.example:8080/p',
+    'https://port.example:8081/p',
+    'http://port.example/p'
+  ]) {
+    assert.ok(seen.includes(url), `${url} が個別に確認されていない`);
+  }
+  assert.equal(results[0].status, 200);
+  assert.equal(results[1].status, 404);
+  assert.equal(results[2].status, 200);
+});
+
+test('中断で打ち切られた行は未着手の行と同じスキップになる', async () => {
+  const entries = analyzeCsv('⭐, https://hang2.example, yellow').urls;
+
+  const results = await runChecks(
+    entries,
+    { dns: true, http: true, timeoutMs: 1000, concurrency: 1 },
+    {
+      // DNS が返らないまま中断される状況を作る
+      lookup: () => new Promise(() => {}),
+      fetchImpl: async () => ({ status: 200, body: { cancel() {} } }),
+      shouldStop: (() => {
+        let calls = 0;
+        return () => (calls += 1) > 2;
+      })()
+    }
+  );
+
+  assert.equal(results[0].level, 'skipped');
+  assert.match(results[0].detail, /未チェック/);
+  assert.equal(results[0].dns, 'skipped');
+  assert.equal(results[0].http, 'skipped');
+});
+
+test('中断済みなら www 付きの追加確認を始めない', async () => {
+  const entries = analyzeCsv('⭐, https://gone.example/p, yellow').urls;
+  const seen = [];
+
+  const results = await runChecks(
+    entries,
+    { dns: true, http: true, www: true, timeoutMs: 1000, concurrency: 1 },
+    {
+      lookup: async (host) => {
+        // www 付きの解決を試みたかどうかで判定する
+        if (host.startsWith('www.')) seen.push(host);
+        return { address: '1.1.1.1' };
+      },
+      fetchImpl: async (url) => {
+        if (url.includes('gone.example')) {
+          throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        }
+        return { status: 200, body: { cancel() {} } };
+      },
+      shouldStop: () => true
+    }
+  );
+
+  assert.deepEqual(seen, []);
+  assert.equal(results[0].level, 'skipped');
 });

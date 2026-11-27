@@ -11,25 +11,64 @@ const USER_AGENT = 'acid-tabs-checker (local, stateless)';
 // 応答しないホストを待ち続けると、その分だけ関数の実行時間（＝課金対象）が延びる
 const DEFAULT_TIMEOUT_MS = 5000;
 
-/** DNS 解決が返らない場合に実行全体を止めないための上限。 */
-function withDeadline(promise, ms) {
+/**
+ * DNS 解決の待ち時間の上限。
+ * 実行全体の中断（クライアント切断・実行予算超過）でも待つのをやめ、
+ * ワーカーが並列枠を解放できるようにする。
+ */
+function withDeadline(promise, ms, stopSignal) {
   // 打ち切り後に元の Promise が失敗しても未処理の拒否にしない
   promise.catch(() => {});
 
   let timer;
+  let onStop;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => {
       reject(Object.assign(new Error('DNS lookup timed out'), { code: 'ETIMEOUT' }));
     }, ms);
+
+    if (stopSignal) {
+      onStop = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      if (stopSignal.aborted) onStop();
+      else stopSignal.addEventListener('abort', onStop, { once: true });
+    }
   });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timer);
+    if (onStop) stopSignal.removeEventListener('abort', onStop);
+  });
 }
 
 /** 複数の中断条件のうち、最初に成立したものを fetch の signal として使う。 */
 function combineSignals(...signals) {
   const list = signals.filter(Boolean);
   if (list.length === 1) return list[0];
-  return AbortSignal.any(list);
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any(list);
+
+  // AbortSignal.any は Node.js 20.3.0 以降。宣言上の対応範囲（>=20）向けの代替実装。
+  // 合成が成立した時点で元の signal からリスナーを外し、実行ごとに溜まらないようにする。
+  const controller = new AbortController();
+  const detach = [];
+  const release = () => {
+    for (const off of detach) off();
+    detach.length = 0;
+  };
+
+  for (const signal of list) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      break;
+    }
+    const onAbort = () => controller.abort(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    detach.push(() => signal.removeEventListener('abort', onAbort));
+  }
+
+  if (controller.signal.aborted) release();
+  else controller.signal.addEventListener('abort', release, { once: true });
+
+  return controller.signal;
 }
 
 const MAX_REDIRECTS = 5;
@@ -77,7 +116,8 @@ async function followRedirects(startUrl, method, context) {
       // 名前解決が返らないホストでもリダイレクト追跡を止めない
       await withDeadline(
         resolvePublicAddresses(target.host, context.lookup),
-        context.timeoutMs ?? DEFAULT_TIMEOUT_MS
+        context.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        context.stopSignal
       );
     }
 
@@ -225,6 +265,9 @@ function withWwwHost(urlString) {
  * 確認した場合は結果を返し、対象外なら null を返す。
  */
 async function probeWwwAlternative(urlString, context, timeoutMs) {
+  // 中断済みなら追加の通信を始めない（待ち時間と課金対象を増やさない）
+  if (context.stopSignal?.aborted) return null;
+
   const alternative = withWwwHost(urlString);
   if (!alternative) return null;
 
@@ -256,6 +299,36 @@ function applyWwwProbe(result, probe) {
     result.detail = result.detail ? `${result.detail} / ${notice}` : notice;
   }
 
+  return result;
+}
+
+/**
+ * 通信結果を共有してよい単位を表すキー。
+ * entry.normalized は重複表示用にスキームとポートを落とすため、
+ * 別々に確認すべき URL（http と https、ポート違い）まで同一視してしまう。
+ */
+function networkKey(entry) {
+  try {
+    const parsed = new URL(entry.url);
+    const path = parsed.pathname.replace(/\/+$/, '');
+    return `${parsed.origin}${path}${parsed.search}`;
+  } catch {
+    return entry.normalized || entry.url;
+  }
+}
+
+const STOPPED_DETAIL = '中断または時間切れのため未チェック（対象を絞って再実行してください）';
+
+/** 中断で打ち切られた行を「未チェック」として記録する。 */
+function markStopped(result) {
+  result.dns = 'skipped';
+  result.http = 'skipped';
+  result.www = 'skipped';
+  result.wwwStatus = null;
+  result.wwwUrl = '';
+  result.status = null;
+  result.level = 'skipped';
+  result.detail = STOPPED_DETAIL;
   return result;
 }
 
@@ -305,7 +378,8 @@ export async function checkOne(entry, options, deps) {
   try {
     addresses = await withDeadline(
       resolvePublicAddresses(entry.host, deps.lookup),
-      timeoutMs
+      timeoutMs,
+      deps.stopSignal
     );
   } catch (error) {
     if (error instanceof BlockedTargetError) {
@@ -313,6 +387,9 @@ export async function checkOne(entry, options, deps) {
       result.detail = `ブロック: ${error.message}`;
       return result;
     }
+
+    // 中断による打ち切りは失敗ではないため、未着手の行と同じ扱いにする
+    if (deps.stopSignal?.aborted) return markStopped(result);
 
     if (dns) result.dns = 'fail';
     result.level = 'error';
@@ -338,6 +415,7 @@ export async function checkOne(entry, options, deps) {
       fetchImpl: deps.fetchImpl,
       lookup: deps.lookup,
       strictPorts,
+      timeoutMs,
       stopSignal: deps.stopSignal,
       signal: AbortSignal.timeout(timeoutMs)
     });
@@ -366,6 +444,10 @@ export async function checkOne(entry, options, deps) {
       result.detail = `HTTP ${response.status}`;
     }
   } catch (error) {
+    if (deps.stopSignal?.aborted && !(error instanceof BlockedTargetError)) {
+      return markStopped(result);
+    }
+
     result.http = 'fail';
     result.level = 'error';
     result.detail = errorDetail(error, timeoutMs);
@@ -429,7 +511,7 @@ export async function runChecks(entries, options = {}, hooks = {}) {
   const checkShared = (entry) => {
     if (!entry.checkable) return checkOne(entry, checkOptions, deps);
 
-    const key = entry.normalized || entry.url;
+    const key = networkKey(entry);
 
     let promise = shared.get(key);
     if (!promise) {
@@ -539,7 +621,11 @@ export async function runChecks(entries, options = {}, hooks = {}) {
     }, STOP_POLL_INTERVAL_MS);
 
     pump();
-  }).finally(() => clearInterval(watcher));
+  }).finally(() => {
+    clearInterval(watcher);
+    // 失敗で打ち切る場合も実行中の通信を止める（完了済みなら対象がない）
+    stop.abort();
+  });
 
   // 時間切れで着手できなかった URL は「未チェック」として明示する
   // （new Array(n) は疎配列なので forEach では穴が飛ばされる）
@@ -561,7 +647,7 @@ export async function runChecks(entries, options = {}, hooks = {}) {
       wwwUrl: '',
       status: null,
       level: 'skipped',
-      detail: '時間切れのため未チェック（対象を絞って再実行してください）'
+      detail: STOPPED_DETAIL
     };
     results[index] = skipped;
     unfinished.push([skipped, index]);
