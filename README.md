@@ -4,7 +4,7 @@
 
 CSV をブラウザから読み込むと、サーバーのメモリ上で解析し、DNS・HTTP の疎通、重複 URL、ワイルドカードや特殊 URL をチェックします。チェック結果は画面表示とレポートのダウンロードのみで、CSV や結果をディスク・DB・ブラウザストレージに保存しません。
 
-ローカルでもコンテナでも同じイメージで動作し、Vercel / Azure / Google Cloud Run にデプロイできます。
+ローカルでもコンテナでも同じイメージで動作し、blitz.cloud / Azure / Google Cloud Run にデプロイできます。
 
 ## 特徴
 
@@ -52,32 +52,21 @@ docker run --rm -p 8080:8080 \
 
 成果物は Docker イメージ 1 つです。どの環境でも `HOST=0.0.0.0` と `PORT` を明示し、公開環境では `APP_ENV=deployed` を設定してください。
 
-`APP_ENV=deployed`（または Vercel 上）では、次の制限が有効になります。
+公開環境と判定されると、次の制限が有効になります。`APP_ENV=deployed` を明示するか、`HOST` をループバック以外（`0.0.0.0` など）にすると公開環境として扱います。
 
 - HTTP チェックの接続先ポートを `80` / `443` に限定
 - UI のプライバシーバッジを「公開環境で実行中」に切り替え
 
-### Vercel（Container Runtime / beta）
+### blitz.cloud
 
-ルートの `Dockerfile` を Vercel Functions の Container Runtime で動かします。`vercel.json` で `framework: "container"` を指定しています。
+ルートの `Dockerfile` からビルドしたイメージを動かします。ダッシュボードで GitHub リポジトリか Docker イメージを選ぶと、HTTPS のアドレスが割り当てられます。
 
-```bash
-npm i -g vercel
-vercel login
-
-# 既存プロジェクトで別フレームワークとして検出された場合
-vercel project update --framework container --yes
-
-# Vercel の既定ポートは 80 のため、このイメージが待ち受ける 8080 を指定する
-vercel env add PORT production   # 値: 8080
-
-vercel --prod
-```
-
-- Hobby プランでは実行時間 300 秒、リクエスト / レスポンスボディ 4.5MB が上限です。アプリ側のボディ上限は 4MB にしています。
-- Vercel は `VERCEL=1` を自動設定するため、`APP_ENV` の指定は不要です。
-- 停止時は `SIGTERM` のあと 30 秒で強制終了されます。サーバーは graceful shutdown に対応しています。
-- 公開する場合は Vercel Deployment Protection などでアクセス制御することを推奨します。
+- blitz.cloud は `PORT=8080` を自動で設定します。`Dockerfile` の `EXPOSE 8080` と一致しているため、ポートの指定は不要です。
+- blitz.cloud は `APP_ENV` を設定しません。`Dockerfile` が `HOST=0.0.0.0` を設定するため、公開環境として自動判定されます。明示したい場合は Environment タブで `APP_ENV=deployed` を追加してください。
+- 無料枠はアプリのメモリ 128MB（small）が 4 つ分です。HTTP チェックは外向き通信なので CPU 上限には触れにくい構成です。
+- アクセスが 30 分ないアプリはスリープし、次回アクセス時に約 10 秒で復帰します。スリープ中はメモリを消費しません。
+- 外向き通信の速度上限は 50 Mbit/s です。流量の課金はありません。
+- 送信メール（25 / 465 / 587）は無料枠ではブロックされます。このアプリはメールを使いません。
 
 ### Azure Container Apps
 
@@ -207,7 +196,7 @@ HTTP ステータスの扱い:
 - プライベート / ループバック / リンクルーカル / CGNAT / マルチキャスト / ドキュメント用などの予約済みアドレスを拒否
 - DNS 解決結果の**すべての IP** を検査（1 つでも非公開アドレスなら拒否）
 - リダイレクト先も毎回再検証し、最大 5 ホップで打ち切り
-- 公開環境（`APP_ENV=deployed` / Vercel）では接続ポートを `80` / `443` に限定
+- 公開環境（`APP_ENV=deployed`、またはループバック以外で待ち受ける構成）では接続ポートを `80` / `443` に限定
 
 ## CSV 形式
 
@@ -321,7 +310,9 @@ CSV を解析してカテゴリ、URL、重複、構造エラーを返します�
 | --- | --- | --- |
 | `PORT` | `3000` | 待ち受けポート（Docker イメージでは `8080`） |
 | `HOST` | `127.0.0.1` | 待ち受けホスト（コンテナでは `0.0.0.0` を明示） |
-| `APP_ENV` | （なし） | `deployed` で公開環境向けの制限を有効化 |
+| `APP_ENV` | （なし） | `deployed` / `local` を明示。未指定なら `HOST` で判定 |
+
+`APP_ENV` を指定しない場合、`HOST` がループバック（`127.0.0.1`、`localhost`、`::1`）ならローカル、それ以外（`0.0.0.0` など）なら公開環境として扱います。
 
 アプリ側のリクエストボディ上限は 4MB です。
 
@@ -358,7 +349,6 @@ test/
   clean.test.js
 Dockerfile
 compose.yaml
-vercel.json
 ```
 
 チェックしたい CSV はアプリに読み込むだけで、リポジトリには置かないでください。

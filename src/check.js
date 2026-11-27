@@ -1,5 +1,6 @@
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
+import { isDeployed } from './config.js';
 import {
   BlockedTargetError,
   assertHttpUrl,
@@ -469,7 +470,7 @@ export async function checkOne(entry, options, deps) {
  * hooks.onResult で完了ごとに結果を受け取れる（ストリーミング用）。
  */
 const CONCURRENCY_RAMP_STEP = 6;
-// Vercel の関数は最大 300 秒で打ち切られる。ストリームが途中で切れないよう手前で止める。
+// プロキシやプラットフォーム側の上限より手前で打ち切り、ストリームが途中で切れないようにする。
 const DEFAULT_BUDGET_MS = 240000;
 const STOP_POLL_INTERVAL_MS = 250;
 
@@ -481,7 +482,7 @@ export async function runChecks(entries, options = {}, hooks = {}) {
     timeoutMs = DEFAULT_TIMEOUT_MS,
     concurrency = 30,
     budgetMs = DEFAULT_BUDGET_MS,
-    strictPorts = process.env.APP_ENV === 'deployed' || Boolean(process.env.VERCEL)
+    strictPorts = isDeployed()
   } = options;
 
   const startedAt = Date.now();

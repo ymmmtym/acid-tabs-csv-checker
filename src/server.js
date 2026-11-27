@@ -8,6 +8,7 @@ import { brotliCompress, gzip, createBrotliCompress, createGzip, constants } fro
 import { finished } from 'node:stream';
 import { analyzeCsv } from './parse.js';
 import { runChecks } from './check.js';
+import { isDeployed } from './config.js';
 
 const gzipAsync = promisify(gzip);
 const brotliCompressAsync = promisify(brotliCompress);
@@ -16,8 +17,7 @@ const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
 // コンテナ / サーバーレス上では、より厳しい接続先制限を有効にする
-const DEPLOYED =
-  process.env.APP_ENV === 'deployed' || Boolean(process.env.VERCEL);
+const DEPLOYED = isDeployed();
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
