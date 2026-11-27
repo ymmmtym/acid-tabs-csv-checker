@@ -2,9 +2,20 @@ import { isIP } from 'node:net';
 
 const LOOPBACK_HOSTS = new Set(['localhost', '::1']);
 
+// 表記ゆれ（0:0:0:0:0:0:0:1 など）を吸収するため、IPv6 は URL パーサで正規化する
+function normalizeHost(host) {
+  const bare = host.replace(/^\[|\]$/g, '');
+  if (isIP(bare) !== 6) return bare;
+  try {
+    return new URL(`http://[${bare}]`).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    return bare;
+  }
+}
+
 function isLoopbackHost(host) {
   if (!host) return true;
-  const bare = host.replace(/^\[|\]$/g, '');
+  const bare = normalizeHost(host);
   if (LOOPBACK_HOSTS.has(bare)) return true;
   // 127.0.0.0/8
   return isIP(bare) === 4 && bare.startsWith('127.');

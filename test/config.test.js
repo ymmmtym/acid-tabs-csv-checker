@@ -16,6 +16,15 @@ test('ループバックで待ち受ける場合はローカルとみなす', ()
   assert.equal(isDeployed({ HOST: '[::1]' }), false);
 });
 
+test('IPv6 ループバックは表記が違っても同じ扱いにする', () => {
+  assert.equal(isDeployed({ HOST: '0:0:0:0:0:0:0:1' }), false);
+  assert.equal(isDeployed({ HOST: '0000:0000:0000:0000:0000:0000:0000:0001' }), false);
+  assert.equal(isDeployed({ HOST: '[0:0:0:0:0:0:0:1]' }), false);
+  // 未指定アドレスは外部から到達しうるため公開環境として扱う
+  assert.equal(isDeployed({ HOST: '::' }), true);
+  assert.equal(isDeployed({ HOST: '0:0:0:0:0:0:0:0' }), true);
+});
+
 test('外部から到達できるホストで待ち受ける場合は公開環境とみなす', () => {
   assert.equal(isDeployed({ HOST: '0.0.0.0' }), true);
   assert.equal(isDeployed({ HOST: '[::]' }), true);
