@@ -1,5 +1,8 @@
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
+import { isDeployed } from './config.js';
+import { describeRdap, lookupRdap, registrableDomain } from './rdap.js';
+import { combineSignals } from './signals.js';
 import {
   BlockedTargetError,
   assertHttpUrl,
@@ -38,37 +41,6 @@ function withDeadline(promise, ms, stopSignal) {
     clearTimeout(timer);
     if (onStop) stopSignal.removeEventListener('abort', onStop);
   });
-}
-
-/** 複数の中断条件のうち、最初に成立したものを fetch の signal として使う。 */
-function combineSignals(...signals) {
-  const list = signals.filter(Boolean);
-  if (list.length === 1) return list[0];
-  if (typeof AbortSignal.any === 'function') return AbortSignal.any(list);
-
-  // AbortSignal.any は Node.js 20.3.0 以降。宣言上の対応範囲（>=20）向けの代替実装。
-  // 合成が成立した時点で元の signal からリスナーを外し、実行ごとに溜まらないようにする。
-  const controller = new AbortController();
-  const detach = [];
-  const release = () => {
-    for (const off of detach) off();
-    detach.length = 0;
-  };
-
-  for (const signal of list) {
-    if (signal.aborted) {
-      controller.abort(signal.reason);
-      break;
-    }
-    const onAbort = () => controller.abort(signal.reason);
-    signal.addEventListener('abort', onAbort, { once: true });
-    detach.push(() => signal.removeEventListener('abort', onAbort));
-  }
-
-  if (controller.signal.aborted) release();
-  else controller.signal.addEventListener('abort', release, { once: true });
-
-  return controller.signal;
 }
 
 const MAX_REDIRECTS = 5;
@@ -223,6 +195,42 @@ async function describeDomainRoot(urlString, context, timeoutMs) {
   });
 }
 
+/**
+ * DNS 解決に失敗したドメインだけ、登録情報（有効期限）を RDAP で確認する。
+ * 同じ登録ドメインの URL が何件あっても問い合わせは 1 回に共有する。
+ */
+async function probeRdap(host, context) {
+  if (context.stopSignal?.aborted) return null;
+
+  const domain = registrableDomain(host);
+  if (!domain) return null;
+
+  return sharedProbe(context.probeCache, `rdap ${domain}`, () =>
+    lookupRdap(domain, {
+      fetchImpl: context.rdapFetchImpl,
+      lookup: context.lookup,
+      signal: context.stopSignal
+    })
+  );
+}
+
+/**
+ * RDAP の確認結果を detail に追記する。
+ * 登録情報は補足であり、URL 自体の到達性は変わらないため level は変更しない。
+ */
+function applyRdapNotice(result, probe) {
+  if (!probe) return result;
+
+  if (!probe.ok) {
+    result.detail = `${result.detail} / ${probe.reason}`;
+    return result;
+  }
+
+  result.detail = `${result.detail} / ${describeRdap(probe)}`;
+  if (probe.expiration) result.expiration = probe.expiration;
+  return result;
+}
+
 function errorDetail(error, timeoutMs) {
   if (error instanceof BlockedTargetError) {
     return `ブロック: ${error.message}`;
@@ -342,8 +350,16 @@ async function appendWwwNotice(result, context, timeoutMs) {
 
 /** 1 件の URL に対して DNS / HTTP チェックを行う。 */
 export async function checkOne(entry, options, deps) {
-  const { dns, http, www = true, timeoutMs = DEFAULT_TIMEOUT_MS, strictPorts = false } = options;
+  const {
+    dns,
+    http,
+    www = true,
+    rdap = false,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    strictPorts = false
+  } = options;
   const checkWww = www !== false;
+  const checkRdap = rdap === true;
 
   const result = {
     id: entry.id,
@@ -357,6 +373,7 @@ export async function checkOne(entry, options, deps) {
     www: 'skipped',
     wwwStatus: null,
     wwwUrl: '',
+    expiration: null,
     status: null,
     level: 'skipped',
     detail: ''
@@ -370,6 +387,7 @@ export async function checkOne(entry, options, deps) {
   const probeContext = {
     fetchImpl: deps.fetchImpl,
     lookup: deps.lookup,
+    rdapFetchImpl: deps.rdapFetchImpl,
     strictPorts,
     timeoutMs,
     probeCache: deps.probeCache,
@@ -397,9 +415,13 @@ export async function checkOne(entry, options, deps) {
     if (dns) result.dns = 'fail';
     result.level = 'error';
     result.detail = `DNS 解決失敗 (${error?.code || error?.message || 'unknown'})`;
-    return checkWww
-      ? appendWwwNotice(result, probeContext, timeoutMs)
-      : result;
+
+    // 名前が引けないドメインだけ登録情報を補う（登録切れの切り分けに使う）
+    const [withWww, rdapProbe] = await Promise.all([
+      checkWww ? appendWwwNotice(result, probeContext, timeoutMs) : result,
+      checkRdap ? probeRdap(entry.host, probeContext) : null
+    ]);
+    return applyRdapNotice(withWww, rdapProbe);
   }
 
   if (dns) {
@@ -469,7 +491,7 @@ export async function checkOne(entry, options, deps) {
  * hooks.onResult で完了ごとに結果を受け取れる（ストリーミング用）。
  */
 const CONCURRENCY_RAMP_STEP = 6;
-// Vercel の関数は最大 300 秒で打ち切られる。ストリームが途中で切れないよう手前で止める。
+// プロキシやプラットフォーム側の上限より手前で打ち切り、ストリームが途中で切れないようにする。
 const DEFAULT_BUDGET_MS = 240000;
 const STOP_POLL_INTERVAL_MS = 250;
 
@@ -478,10 +500,11 @@ export async function runChecks(entries, options = {}, hooks = {}) {
     dns = true,
     http = true,
     www = true,
+    rdap = false,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     concurrency = 30,
     budgetMs = DEFAULT_BUDGET_MS,
-    strictPorts = process.env.APP_ENV === 'deployed' || Boolean(process.env.VERCEL)
+    strictPorts = isDeployed()
   } = options;
 
   const startedAt = Date.now();
@@ -502,12 +525,13 @@ export async function runChecks(entries, options = {}, hooks = {}) {
   const deps = {
     lookup,
     fetchImpl: hooks.fetchImpl ?? globalThis.fetch,
+    rdapFetchImpl: hooks.rdapFetchImpl ?? globalThis.fetch,
     // トップページ / www の追加確認を 1 回の実行で共有する
     probeCache: new Map(),
     stopSignal: stop.signal
   };
 
-  const checkOptions = { dns, http, www, timeoutMs, strictPorts };
+  const checkOptions = { dns, http, www, rdap, timeoutMs, strictPorts };
 
   // 同じ URL を指す行（表記ゆれ・重複）は 1 回だけ通信し、結果を複製する
   const shared = new Map();

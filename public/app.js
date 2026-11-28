@@ -1,4 +1,5 @@
 import { buildCleanedCsv } from './clean.js';
+import { privacyBadge } from './privacy-badge.js';
 import { attachResultKeyboardNavigation } from './result-keyboard.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -17,7 +18,9 @@ const state = {
   filter: 'all',
   search: '',
   runId: 0,
-  focusedRowIndex: -1
+  focusedRowIndex: -1,
+  // 実行中のチェック条件。バッジはこの値だけを見て外部送信の有無を表示する
+  runOptions: null
 };
 
 const LEVEL_LABELS = {
@@ -107,6 +110,7 @@ function currentOptions() {
     dns: $('#opt-dns').checked,
     http: $('#opt-http').checked,
     www: $('#opt-www').checked,
+    rdap: $('#opt-rdap').checked,
     timeoutMs: Number($('#opt-timeout').value),
     concurrency: Number($('#opt-concurrency').value)
   };
@@ -548,10 +552,12 @@ async function loadCsv(text, name) {
   state.bom = text.charCodeAt(0) === 0xfeff;
   state.finished = false;
   state.running = false;
+  state.runOptions = null;
   state.filter = 'all';
   state.search = '';
   $('#search').value = '';
   clearAlert();
+  renderPrivacyBadge();
 
   $('#results-card').classList.add('hidden');
   $('#issues-card').classList.add('hidden');
@@ -607,6 +613,7 @@ async function startCheck() {
   state.running = true;
   state.finished = false;
   state.abort = new AbortController();
+  state.runOptions = options;
   const runId = ++state.runId;
   clearAlert();
 
@@ -670,6 +677,8 @@ async function startCheck() {
     if (state.runId === runId) {
       state.running = false;
       state.abort = null;
+      state.runOptions = null;
+      renderPrivacyBadge();
       $('#start-btn').disabled = false;
       $('#cancel-btn').classList.add('hidden');
       $('#downloads')
@@ -718,9 +727,11 @@ function reset() {
   state.bom = false;
   state.running = false;
   state.finished = false;
+  state.runOptions = null;
   state.filter = 'all';
   state.search = '';
   clearAlert();
+  renderPrivacyBadge();
   showCopyStatus('');
   updateSelectionUi();
   $('#file-input').value = '';
@@ -753,6 +764,7 @@ function buildReport() {
       dnsAddress: result?.dnsAddress ?? '',
       http: result?.http ?? 'pending',
       status: result?.status ?? null,
+      expiration: result?.expiration ?? null,
       level: result?.level ?? 'pending',
       detail: result?.detail ?? ''
     };
@@ -787,6 +799,7 @@ function reportCsv(report) {
     'line',
     'dns',
     'http_status',
+    'expiration',
     'duplicate',
     'detail'
   ];
@@ -798,6 +811,7 @@ function reportCsv(report) {
     url.line,
     url.dns,
     url.status ?? '',
+    url.expiration ?? '',
     url.isDuplicate ? 'yes' : 'no',
     url.detail
   ]);
@@ -882,24 +896,41 @@ function download(filename, content, type) {
   URL.revokeObjectURL(url);
 }
 
-async function applyHealthBadge() {
+let healthMode = 'local';
+
+/**
+ * プライバシーバッジを表示する。
+ * ドメイン登録情報をオンにすると外部送信が発生するため、文言もそれに合わせる。
+ */
+function renderPrivacyBadge() {
   const badge = $('#privacy-badge');
   if (!badge) return;
 
+  // 実行中は送信済みの条件で表示する。途中でチェックを外しても、
+  // 実際に走っている実行が送信を続けている間は「外部送信なし」と表示しない。
+  const rdapOn = state.runOptions ? state.runOptions.rdap === true : $('#opt-rdap')?.checked === true;
+  const deployed = healthMode === 'deployed';
+
+  badge.classList.toggle('is-deployed', deployed);
+  const { text, title } = privacyBadge({ rdap: rdapOn, deployed });
+  badge.textContent = text;
+  badge.title = title;
+}
+
+async function applyHealthBadge() {
+  if (!$('#privacy-badge')) return;
+
   try {
     const response = await fetch('/api/health', { cache: 'no-store' });
-    if (!response.ok) return;
-
-    const health = await response.json();
-    if (health.mode === 'deployed') {
-      badge.textContent = '保存しません / 公開環境で実行中';
-      badge.classList.add('is-deployed');
-      badge.title =
-        'CSV はブラウザからこのサーバーへ送信されます。ディスク・DB・ブラウザストレージには保存しません。';
+    if (response.ok) {
+      const health = await response.json();
+      if (health.mode === 'deployed') healthMode = 'deployed';
     }
   } catch {
     // 表示の切り替えに失敗してもアプリの動作には影響しない
   }
+
+  renderPrivacyBadge();
 }
 
 function fileTimestamp() {
@@ -1038,6 +1069,8 @@ function init() {
   const fileInput = $('#file-input');
 
   applyHealthBadge();
+
+  $('#opt-rdap')?.addEventListener('change', renderPrivacyBadge);
 
   const pastePanel = document.querySelector('.paste-panel');
   if (pastePanel) {

@@ -8,6 +8,7 @@ import { brotliCompress, gzip, createBrotliCompress, createGzip, constants } fro
 import { finished } from 'node:stream';
 import { analyzeCsv } from './parse.js';
 import { runChecks } from './check.js';
+import { isDeployed } from './config.js';
 
 const gzipAsync = promisify(gzip);
 const brotliCompressAsync = promisify(brotliCompress);
@@ -16,8 +17,7 @@ const PUBLIC_DIR = fileURLToPath(new URL('../public/', import.meta.url));
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
 // コンテナ / サーバーレス上では、より厳しい接続先制限を有効にする
-const DEPLOYED =
-  process.env.APP_ENV === 'deployed' || Boolean(process.env.VERCEL);
+const DEPLOYED = isDeployed();
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -180,10 +180,12 @@ function clampInt(value, min, max, fallback) {
   return Math.min(max, Math.max(min, number));
 }
 
-function sanitizeOptions(raw = {}) {
+export function sanitizeOptions(raw = {}) {
   const dns = raw.dns !== false;
   const http = raw.http !== false;
   const www = raw.www !== false;
+  // 登録情報の確認は外部サービスへの問い合わせになるため、明示的に有効化されたときだけ行う
+  const rdap = raw.rdap === true;
 
   if (!dns && !http) {
     throw new HttpError(400, 'DNS か HTTP のどちらかを有効にしてください');
@@ -193,6 +195,7 @@ function sanitizeOptions(raw = {}) {
     dns,
     http,
     www,
+    rdap,
     timeoutMs: clampInt(raw.timeoutMs, 1000, 30000, 5000),
     concurrency: clampInt(raw.concurrency, 1, 30, 30),
     // 公開環境では 80/443 以外への接続を許可しない
